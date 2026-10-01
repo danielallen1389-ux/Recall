@@ -89,8 +89,8 @@ button, input, select, textarea { font: inherit; color: inherit; font-variation-
 
 /* Top bar */
 .top { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper); border-bottom: 1px solid var(--line); }
-.top .wrap { display: flex; align-items: center; justify-content: space-between; gap: .5rem 1rem; flex-wrap: wrap; padding-block: .75rem 0; }
-.brand { display: flex; align-items: center; gap: .6rem; padding-bottom: .6rem; }
+.top .wrap { display: grid; gap: .1rem; padding-block: .7rem 0; }
+.brand { display: flex; align-items: center; gap: .6rem; padding-bottom: .35rem; }
 .brand-mark {
   width: 26px; height: 18px; border-radius: 2px; flex: none;
   background:
@@ -100,11 +100,10 @@ button, input, select, textarea { font: inherit; color: inherit; font-variation-
   box-shadow: 0 0 0 1px var(--line), 2px 2px 0 var(--line);
 }
 .brand-name { font-weight: 750; font-size: var(--s-lg); letter-spacing: -.01em; font-variation-settings: "CASL" .6, "MONO" 0, "CRSV" 1; }
-.top-right { display: flex; align-items: center; gap: .75rem; padding-bottom: .6rem; }
-.who { appearance: none; border: 1px solid var(--line); background: var(--card); border-radius: 999px; padding: .3rem .75rem; font-size: var(--s-sm); font-weight: 600; cursor: pointer; max-width: 14rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.who { appearance: none; border: 1px solid var(--line); background: var(--card); border-radius: 999px; padding: .25rem .7rem; font-size: var(--s-xs); font-weight: 650; cursor: pointer; max-width: 11rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-left: auto; align-self: center; margin-bottom: .35rem; flex: none; }
 .who[aria-current="page"] { border-color: var(--accent); color: var(--accent); }
-.tabs { display: flex; gap: .15rem; width: 100%; overflow-x: auto; scrollbar-width: none; }
-.tab { appearance: none; border: 0; background: none; cursor: pointer; padding: .5rem .75rem .7rem; font-size: var(--s-sm); font-weight: 600; color: var(--ink-soft); border-bottom: 2.5px solid transparent; border-radius: 0; white-space: nowrap; }
+.tabs { display: flex; gap: .1rem; width: 100%; overflow-x: auto; scrollbar-width: none; align-items: flex-end; }
+.tab { appearance: none; border: 0; background: none; cursor: pointer; padding: .5rem .7rem .7rem; font-size: var(--s-sm); font-weight: 600; color: var(--ink-soft); border-bottom: 2.5px solid transparent; border-radius: 0; white-space: nowrap; }
 .tab:hover { color: var(--ink); }
 .tab[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--accent); }
 
@@ -213,6 +212,7 @@ details.how p { margin: .5rem 0 0; font-size: var(--s-sm); color: var(--ink-soft
 .sess-actions { display: flex; flex-wrap: wrap; gap: .75rem; align-items: center; justify-content: space-between; }
 .sess-actions .main { display: flex; flex-wrap: wrap; gap: .6rem; margin-left: auto; }
 .keys { margin: 0; font-size: var(--s-xs); color: var(--ink-soft); text-align: right; }
+.keys:empty { display: none; }
 .keys kbd { font-variation-settings: var(--fv-data); border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 0 .3em; background: var(--card); font-size: .95em; }
 @media (pointer: coarse) { .keys { display: none; } }
 .done-list { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--line); }
@@ -237,6 +237,7 @@ textarea.poem-input { font-variation-settings: var(--fv-hand); min-height: 16rem
 .status { margin: 0; font-size: var(--s-sm); font-weight: 600; min-height: 1.5em; }
 .status.ok { color: var(--ok); }
 .status.err { color: var(--danger); }
+.auth-box .status:empty { display: none; }
 .preview { display: grid; gap: .6rem; }
 .preview-sum { display: flex; flex-wrap: wrap; gap: .4rem 1rem; font-size: var(--s-sm); }
 .preview-sum b { font-variation-settings: var(--fv-data); }
@@ -304,9 +305,55 @@ table.pv td { max-width: 18rem; overflow-wrap: anywhere; }
 .auth-box h1 { font-size: var(--s-lg); }
 .auth-box p { margin: 0; color: var(--ink-soft); font-size: var(--s-sm); }
 
-.toast { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(1rem + env(safe-area-inset-bottom, 0px)); max-width: min(32rem, calc(100% - 2rem)); z-index: 20; background: var(--ink); color: var(--paper); padding: .7rem 1rem; border-radius: 8px; font-size: var(--s-sm); box-shadow: var(--shadow); }
+.toast { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(5.5rem + env(safe-area-inset-bottom, 0px)); max-width: min(32rem, calc(100% - 2rem)); z-index: 20; background: var(--ink); color: var(--paper); padding: .7rem 1rem; border-radius: 8px; font-size: var(--s-sm); box-shadow: var(--shadow); }
 
+
+/* v2: grading, typing, hints */
+.sess-actions { position: sticky; bottom: 0; z-index: 5; background: var(--paper); padding-block: .65rem calc(.65rem + env(safe-area-inset-bottom, 0px)); border-top: 1px solid var(--line); }
+.btn.miss { background: var(--card); border-color: var(--danger); color: var(--danger); }
+.btn.miss:hover:not([disabled]) { background: var(--danger-soft); }
+.hintlines { margin: 0; color: var(--ink-soft); font-size: var(--s-lg); line-height: var(--lh-card); white-space: pre-wrap; overflow-wrap: anywhere; }
+.typebox { display: grid; gap: .4rem; }
+.typebox textarea { font-variation-settings: var(--fv-hand); font-size: var(--s-lg); min-height: 3.2rem; resize: vertical; line-height: 1.6; }
+.typebox textarea.poem { min-height: 18rem; font-size: var(--s-md); line-height: 1.75; }
+.verdict { border-radius: 8px; padding: .75rem 1rem; display: flex; flex-wrap: wrap; gap: .35rem 1rem; align-items: center; justify-content: space-between; font-size: var(--s-sm); font-weight: 600; }
+.verdict.ok { background: var(--ok-soft); color: var(--ok); }
+.verdict.bad { background: var(--danger-soft); color: var(--danger); }
+.verdict.neutral { background: var(--card); border: 1px solid var(--line); color: var(--ink); }
+.verdict .linkbtn { color: inherit; }
+.lines-missed { display: flex; flex-wrap: wrap; gap: .5rem 1rem; align-items: center; }
+.lines-missed .stepper input { width: 3rem; font-size: var(--s-md); }
+.w-miss { background: var(--danger-soft); color: var(--danger); border-radius: 3px; text-decoration: underline wavy var(--danger); text-underline-offset: 4px; }
+.w-extra { color: var(--danger); text-decoration: line-through; }
+.typed-copy { font-size: var(--s-sm); }
+.typed-copy summary { cursor: pointer; color: var(--ink-soft); font-weight: 600; }
+.typed-copy p { margin: .5rem 0 0; white-space: pre-wrap; line-height: 1.7; overflow-wrap: anywhere; }
+.streak { display: flex; flex-wrap: wrap; gap: .35rem 1.1rem; font-size: var(--s-sm); color: var(--ink-soft); }
+.streak b { color: var(--ink); font-variation-settings: var(--fv-data); }
+.opts { display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); gap: 1.25rem 1.5rem; }
+.opts select { width: auto; min-width: 12rem; }
+.pill.due { background: var(--accent-soft); color: var(--accent); }
+.pill.missed { background: var(--danger-soft); color: var(--danger); }
+.pill.mastered { background: var(--ok-soft); color: var(--ok); }
+.pill.edit { border: 1px dashed var(--ok); color: var(--ok); }
+.mastery { display: grid; grid-template-columns: 5rem auto; gap: .5rem; align-items: center; justify-items: end; font-size: var(--s-xs); color: var(--ink-soft); }
+.mastery .bar { width: 5rem; height: 5px; }
+.mastery .bar > i { background: var(--ok); }
+.item.sel-mode { grid-template-columns: auto minmax(0, 1fr) auto; }
+.item .pick { width: 1.1rem; height: 1.1rem; margin-top: .15rem; accent-color: var(--accent); }
+.selbar { position: sticky; bottom: 0; z-index: 5; background: var(--card); border: 1px solid var(--line); border-radius: var(--r); padding: .75rem 1rem; display: flex; flex-wrap: wrap; gap: .6rem 1rem; align-items: center; box-shadow: var(--shadow); margin-bottom: env(safe-area-inset-bottom, 0px); }
+.selbar select { width: auto; max-width: 14rem; padding-block: .45rem; }
+.settings { display: grid; gap: .6rem; padding-top: .75rem; border-top: 1px solid var(--line); width: 100%; }
+.settings .row select { width: auto; padding-block: .4rem; }
+.toast { display: flex; gap: 1rem; align-items: center; }
+.toast button { appearance: none; border: 0; background: none; color: var(--accent-soft); font-weight: 700; cursor: pointer; text-decoration: underline; text-underline-offset: 3px; padding: 0; }
+
+.who-short { display: none; }
 @media (max-width: 520px) {
+  .who-full { display: none; }
+  .who-short { display: inline; }
+  .who { padding: .25rem .55rem; }
+  .tab { padding-inline: .55rem; }
   .stats dd { font-size: var(--s-md); }
   .prompt, .answer { font-size: var(--s-lg); }
   .answer.poem { font-size: var(--s-md); }
@@ -334,12 +381,12 @@ table.pv td { max-width: 18rem; overflow-wrap: anywhere; }
   <header class="top">
     <div class="wrap">
       <div class="brand"><span class="brand-mark" aria-hidden="true"></span><span class="brand-name">Recall by Hand</span></div>
-      <div class="top-right"><button class="who" type="button" id="whoBtn"></button></div>
       <nav class="tabs" role="tablist" aria-label="Sections">
         <button class="tab" role="tab" type="button" data-view="study">Study</button>
         <button class="tab" role="tab" type="button" data-view="decks">Decks</button>
         <button class="tab" role="tab" type="button" data-view="add">Add</button>
         <button class="tab" role="tab" type="button" data-view="people" id="peopleTab" hidden>People</button>
+        <button class="who" type="button" id="whoBtn" aria-label="Your account"></button>
       </nav>
     </div>
   </header>
@@ -353,7 +400,10 @@ table.pv td { max-width: 18rem; overflow-wrap: anywhere; }
         <div class="sess-top">
           <span class="mono" id="sessProgress">1 / 10</span>
           <span class="bar" aria-hidden="true"><i id="sessBar"></i></span>
-          <button class="linkbtn quiet" type="button" id="endBtn">End set</button>
+          <div class="row" style="gap:.9rem">
+            <button class="linkbtn quiet" type="button" id="undoBtn" hidden>Undo</button>
+            <button class="linkbtn quiet" type="button" id="endBtn">End set</button>
+          </div>
         </div>
         <article class="card" aria-live="polite">
           <div class="card-head">
@@ -365,21 +415,18 @@ table.pv td { max-width: 18rem; overflow-wrap: anywhere; }
             <p class="byline" id="cardByline" hidden></p>
             <div class="card-gap"></div>
             <p class="hint" id="cardHint"></p>
-            <p class="firstline hand" id="cardFirstLine" hidden></p>
+            <p class="hintlines hand" id="cardHintLines" hidden></p>
             <p class="answer hand" id="cardAnswer" hidden></p>
           </div>
         </article>
-        <div class="sess-actions">
-          <div class="row">
-            <button class="linkbtn quiet" type="button" id="skipBtn">Skip, don't count it</button>
-            <button class="linkbtn" type="button" id="firstLineBtn" hidden>Show first line</button>
-          </div>
-          <div class="main">
-            <button class="btn primary big" type="button" id="revealBtn">Reveal answer</button>
-            <button class="btn primary big" type="button" id="nextBtn" hidden>Written, next</button>
-          </div>
+        <div class="typebox" id="typeBox" hidden>
+          <label class="label" for="typeInput" id="typeLabel">Your answer</label>
+          <textarea id="typeInput" rows="1" spellcheck="false" autocomplete="off" autocapitalize="off"></textarea>
         </div>
-        <p class="keys"><kbd>Space</kbd> reveal · <kbd>Enter</kbd> record and move on · <kbd>S</kbd> skip</p>
+        <div id="verdictBox" hidden></div>
+        <details class="typed-copy" id="typedCopy" hidden><summary>What you typed</summary><p class="hand" id="typedText"></p></details>
+        <div class="sess-actions" id="sessActions"></div>
+        <p class="keys" id="keysHint"></p>
       </div>
 
       <div id="study-done" class="view" hidden></div>

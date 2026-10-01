@@ -7,21 +7,27 @@ import {
 } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-auth.js';
 import {
   initializeFirestore, persistentLocalCache, persistentMultipleTabManager,
-  doc, collection, query, where, onSnapshot, setDoc, updateDoc, deleteDoc, deleteField, serverTimestamp
+  doc, collection, query, where, onSnapshot, setDoc, updateDoc, deleteDoc, deleteField, serverTimestamp, writeBatch, increment
 } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-firestore.js';
 
 const DAY = 864e5;
 const NEW_DAYS = 30;            // never-written items count as at least this many days overdue
+const MISS_DAYS = 14;           // items missed last time count as at least this many days overdue
+const MASTERED_N = 3;           // right this many times, and right last time
 const MAX_DECK_BYTES = 900000;  // Firestore documents top out at 1 MiB
 const MAX_LIST = 300;
 const MAX_FIELD = 2000;
 const MAX_POEM = 20000;
+const DEFAULT_ALLOW = { facts: 0, poems: 5 };
+const ALLOW_CHOICES = [0, 5, 10, 15, 20, 25, 30, 40, 50];
 const $ = (id) => document.getElementById(id);
 const enc = new TextEncoder();
 
 let app, auth, db;
 
 // ---------------------------------------------------------------- state
+const freshStudy = () => ({ kind: 'facts', sel: { facts: new Set(), poems: new Set() }, count: { facts: 10, poems: 1 }, mode: 'paper', allow: 'deck' });
+const freshDv = () => ({ open: null, q: '', editing: null, renaming: false, confirmDeck: false, creating: false, expanded: new Set(), selecting: false, picked: new Set() });
 const S = {
   phase: 'loading',             // loading | config | setup | signin | inactive | app
   metaLoaded: false, authLoaded: false,
@@ -29,16 +35,17 @@ const S = {
   fbUser: null, me: null, meLoaded: false, myRequest: null,
   isAdmin: false, listenersFor: null, settingUp: false, authShown: null,
   decks: new Map(), deckParts: {}, decksLoaded: false, pendingDecks: new Map(),
-  progress: {}, people: new Map(), requests: new Map(),
+  progress: {}, days: {}, people: new Map(), peopleLoaded: false, requests: new Map(),
   view: 'study',
-  study: { kind: 'facts', sel: { facts: new Set(), poems: new Set() }, count: { facts: 10, poems: 1 } },
+  study: freshStudy(),
   session: null,
-  dv: { open: null, q: '', editing: null, confirmItem: false, renaming: false, confirmDeck: false, creating: false, expanded: new Set() },
+  dv: freshDv(),
   add: { kind: 'facts', deckId: null, chosen: false },
   pp: { renaming: null },
 };
 let userUnsubs = [];
 let dataUnsubs = null;
+let migrated = false;
 
 // ---------------------------------------------------------------- helpers
 function h(tag, props, ...kids) {
@@ -65,6 +72,7 @@ const norm = (s) => String(s || '').trim().toLowerCase().replace(/\s+/g, ' ');
 const myUid = () => (S.fbUser ? S.fbUser.uid : null);
 const myName = () => (S.me && S.me.name) || (S.isAdmin && S.adminName) || 'Me';
 const bytes = (o) => enc.encode(JSON.stringify(o)).length;
+const pct = (x) => `${Math.round(x)}%`;
 
 function ago(t, now) {
   if (!t) return 'never';
@@ -78,25 +86,26 @@ function ago(t, now) {
   if (d < 730) return Math.round(d / 30.4) + ' mo ago';
   return (d / 365).toFixed(1) + ' yr ago';
 }
-function spanDays(days) {
-  if (days < 1) return 'under a day';
-  const d = Math.floor(days);
-  if (d < 60) return plural(d, 'day');
-  if (d < 730) return plural(Math.round(d / 30.4), 'month');
-  return (d / 365).toFixed(1) + ' years';
+function dayKey(date) {
+  const d = date || new Date();
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
 }
 function cleanPoem(text) {
   return String(text || '').replace(/\r\n?/g, '\n').split('\n').map(l => l.replace(/\s+$/, '')).join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 const poemLines = (t) => String(t || '').split('\n').filter(l => l.trim()).length;
 const poemFirstLine = (t) => (String(t || '').split('\n').find(l => l.trim()) || '').trim();
+function poemFirstWords(t) {
+  return String(t || '').split('\n').map(l => { const w = l.trim().split(/\s+/)[0]; return w ? w + ' …' : ''; }).join('\n');
+}
 
 let toastTimer = 0;
-function toast(msg) {
+function toast(msg, action) {
   const t = $('toast');
-  t.textContent = msg; t.hidden = false;
+  put(t, h('span', { text: msg }), action ? h('button', { type: 'button', onclick: () => { t.hidden = true; action.run(); } }, action.label) : null);
+  t.hidden = false;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { t.hidden = true; }, 4500);
+  toastTimer = setTimeout(() => { t.hidden = true; }, action ? 7000 : 4500);
 }
 function authError(e) {
   const c = (e && e.code) || '';
@@ -117,8 +126,8 @@ function dataError(e) {
   if (c.includes('invalid-argument')) return 'That deck is too big to save. Put new items in a new deck.';
   return "Couldn't save that. Try again.";
 }
-async function save(p, okMsg) {
-  try { await p; if (okMsg) toast(okMsg); return true; }
+async function save(p, okMsg, action) {
+  try { await p; if (okMsg) toast(okMsg, action); return true; }
   catch (e) { console.error(e); toast(dataError(e)); return false; }
 }
 async function copyText(text, fallbackEl, okMsg) {
@@ -145,6 +154,90 @@ function withFocus(container, fn) {
   fn();
   if (key) { const el = container.querySelector(`[data-key="${CSS.escape(key)}"]`); if (el) el.focus(); }
 }
+function field(label, input) { return h('div', { class: 'field' }, h('label', { class: 'label', for: input.id, text: label }), input); }
+function check(id, label, checked, onChange, disabled) {
+  const cb = h('input', { type: 'checkbox', id, checked, disabled, 'data-key': id });
+  if (onChange) cb.addEventListener('change', () => onChange(cb.checked));
+  return h('label', { class: 'check', for: id }, cb, h('span', { text: label }));
+}
+function allowSelect(id, value, onChange, withDeckOption) {
+  const sel = h('select', { id, 'data-key': id });
+  if (withDeckOption) sel.append(h('option', { value: 'deck', text: "Each deck's standard" }));
+  for (const n of ALLOW_CHOICES) sel.append(h('option', { value: String(n), text: n === 0 ? '0% (exact)' : `${n}%` }));
+  sel.value = String(value);
+  sel.addEventListener('change', () => onChange(sel.value === 'deck' ? 'deck' : Number(sel.value)));
+  return sel;
+}
+
+// ---------------------------------------------------------------- answer checking
+function normText(s) {
+  return String(s || '').normalize('NFKD').replace(/[̀-ͯ]/g, '').toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, '').replace(/\s+/g, ' ').trim();
+}
+function tokens(text) {
+  const out = [];
+  const re = /(\s+)|(\S+)/g; let m;
+  while ((m = re.exec(String(text || '')))) {
+    if (m[1]) out.push({ raw: m[1], space: true });
+    else { const n = normText(m[2]); out.push({ raw: m[2], norm: n, word: n.length > 0 }); }
+  }
+  return out;
+}
+// Word-level edit distance with a record of which words lined up.
+function alignWords(a, b) {
+  const n = a.length, m = b.length;
+  if ((n + 1) * (m + 1) > 9e6) return null;
+  const W = m + 1;
+  const d = new Uint16Array((n + 1) * W);
+  for (let i = 0; i <= n; i++) d[i * W] = i;
+  for (let j = 0; j <= m; j++) d[j] = j;
+  for (let i = 1; i <= n; i++) for (let j = 1; j <= m; j++) {
+    const c = a[i - 1] === b[j - 1] ? 0 : 1;
+    d[i * W + j] = Math.min(d[(i - 1) * W + j] + 1, d[i * W + j - 1] + 1, d[(i - 1) * W + j - 1] + c);
+  }
+  const aOk = new Array(n).fill(false), bOk = new Array(m).fill(false);
+  let i = n, j = m;
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && a[i - 1] === b[j - 1] && d[i * W + j] === d[(i - 1) * W + j - 1]) { aOk[i - 1] = true; bOk[j - 1] = true; i--; j--; }
+    else if (i > 0 && j > 0 && d[i * W + j] === d[(i - 1) * W + j - 1] + 1) { i--; j--; }
+    else if (i > 0 && d[i * W + j] === d[(i - 1) * W + j] + 1) { i--; }
+    else { j--; }
+  }
+  return { dist: d[n * W + m], aOk, bOk };
+}
+function charDist(a, b) {
+  if (a === b) return 0;
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    prev = cur;
+  }
+  return prev[b.length];
+}
+// How far off a typed answer is (0–100), plus tokens marked for display.
+function grade(expected, typed, poem) {
+  const et = tokens(expected), tt = tokens(typed);
+  const ew = et.filter(t => t.word), tw = tt.filter(t => t.word);
+  let r = alignWords(ew.map(t => t.norm), tw.map(t => t.norm));
+  if (!r) {
+    const aOk = ew.map((t, k) => !!tw[k] && tw[k].norm === t.norm);
+    const bOk = tw.map((t, k) => !!ew[k] && ew[k].norm === t.norm);
+    r = { dist: aOk.filter(x => !x).length + Math.max(0, tw.length - ew.length), aOk, bOk };
+  }
+  ew.forEach((t, k) => { t.ok = r.aOk[k]; });
+  tw.forEach((t, k) => { t.ok = r.bOk[k]; });
+  let off;
+  if (poem) off = (r.dist / Math.max(1, ew.length)) * 100;
+  else {
+    const a = normText(expected), b = normText(typed);
+    off = (charDist(a, b) / Math.max(1, a.length)) * 100;
+  }
+  return { off: Math.min(100, off), et, tt };
+}
+function renderTokens(list, badClass) {
+  return list.map(t => (t.space ? document.createTextNode(t.raw) : h('span', { class: t.word && !t.ok ? badClass : null, text: t.raw })));
+}
 
 // ---------------------------------------------------------------- prefs (per person, per device)
 function loadPrefs() {
@@ -153,25 +246,29 @@ function loadPrefs() {
     if (p.kind === 'facts' || p.kind === 'poems') S.study.kind = p.kind;
     if (p.count) { S.study.count.facts = clampInt(p.count.facts, 1, 200, 10); S.study.count.poems = clampInt(p.count.poems, 1, 50, 1); }
     if (p.sel) for (const k of ['facts', 'poems']) if (Array.isArray(p.sel[k])) S.study.sel[k] = new Set(p.sel[k].filter(x => typeof x === 'string'));
+    if (p.mode === 'paper' || p.mode === 'type') S.study.mode = p.mode;
+    if (p.allow === 'deck' || ALLOW_CHOICES.includes(p.allow)) S.study.allow = p.allow;
   } catch (e) { /* storage unavailable */ }
 }
 function savePrefs() {
   try {
     localStorage.setItem('rbh.prefs.' + myUid(), JSON.stringify({
-      kind: S.study.kind, count: S.study.count,
+      kind: S.study.kind, count: S.study.count, mode: S.study.mode, allow: S.study.allow,
       sel: { facts: [...S.study.sel.facts], poems: [...S.study.sel.poems] },
     }));
   } catch (e) { /* ignore */ }
 }
 
-// ---------------------------------------------------------------- decks and items
+// ---------------------------------------------------------------- decks, items, progress
 function normDeck(id, v) {
+  const kind = v.kind === 'poems' ? 'poems' : 'facts';
+  const legacyUniversal = v.scope === 'universal';
   return {
-    id,
+    id, kind, legacyUniversal,
     name: String(v.name || 'Untitled deck'),
-    kind: v.kind === 'poems' ? 'poems' : 'facts',
-    scope: v.scope === 'universal' ? 'universal' : 'personal',
-    visibility: v.visibility === 'shared' ? 'shared' : 'private',
+    visibility: legacyUniversal || v.visibility === 'shared' ? 'shared' : 'private',
+    friendsCanEdit: v.friendsCanEdit === true,
+    allowPct: typeof v.allowPct === 'number' ? v.allowPct : DEFAULT_ALLOW[kind],
     ownerId: String(v.ownerId || ''),
     ownerName: String(v.ownerName || ''),
     items: (v.items && typeof v.items === 'object') ? v.items : {},
@@ -182,25 +279,19 @@ function itemsOf(d) {
     (d.kind === 'poems' ? (typeof it.title === 'string' && typeof it.text === 'string') : (typeof it.p === 'string' && typeof it.a === 'string')));
 }
 function category(d) {
-  if (d.scope === 'universal') return 'universal';
   if (d.ownerId === myUid()) return 'mine';
   if (d.visibility === 'shared') return 'shared';
   return 'other';
 }
-const canEditUniversal = () => S.isAdmin || !!(S.me && S.me.canEditUniversal === true);
-function canWrite(d) {
-  if (d.scope === 'universal') return canEditUniversal();
-  return S.isAdmin || d.ownerId === myUid();
-}
+const canManage = (d) => S.isAdmin || d.ownerId === myUid();
+const canEditItems = (d) => canManage(d) || (d.visibility === 'shared' && d.friendsCanEdit);
 function ownerLabel(d) {
   if (d.ownerId === myUid()) return 'you';
   const p = S.people.get(d.ownerId);
   return (p && p.name) || d.ownerName || 'someone';
 }
 function sortDecks(list) { return list.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })); }
-function studyDecks(kind) {
-  return sortDecks([...S.decks.values()].filter(d => d.kind === kind && category(d) !== 'other'));
-}
+function studyDecks(kind) { return sortDecks([...S.decks.values()].filter(d => d.kind === kind && category(d) !== 'other')); }
 function pool(kind, sel) {
   const out = [];
   for (const d of studyDecks(kind)) {
@@ -211,11 +302,38 @@ function pool(kind, sel) {
 }
 const progKey = (deckId, itemId) => deckId + '_' + itemId;
 const progOf = (deckId, itemId) => S.progress[progKey(deckId, itemId)] || null;
+const lastMissed = (pr) => !!pr && pr.r === 0;
+function isDue(pr, now) {
+  if (!pr || !Number(pr.t)) return true;
+  if (lastMissed(pr)) return true;
+  const n = Number(pr.n) || 0;
+  const gap = Math.min(60, Math.pow(2, Math.max(0, n - 1)));
+  return (now - Number(pr.t)) / DAY >= gap;
+}
+const isMastered = (pr) => !!pr && !lastMissed(pr) && (Number(pr.n) || 0) >= MASTERED_N;
 function weightOf(it, pr, now) {
   const n = pr ? Math.max(0, Number(pr.n) || 0) : 0;
   const t = pr ? Number(pr.t) || 0 : 0;
-  const days = t ? Math.max(0, (now - t) / DAY) : Math.max(NEW_DAYS, (now - (Number(it.c) || now)) / DAY);
+  let days;
+  if (!t) days = Math.max(NEW_DAYS, (now - (Number(it.c) || now)) / DAY);
+  else {
+    days = Math.max(0, (now - t) / DAY);
+    if (lastMissed(pr)) days = Math.max(days, MISS_DAYS);
+  }
   return (days + 1) / (n + 1);
+}
+function statusOf(pr, now) {
+  if (!pr || !Number(pr.t)) return ['new', 'new'];
+  if (lastMissed(pr)) return ['missed', 'missed last time'];
+  if (isMastered(pr)) return ['mastered', 'mastered'];
+  if (isDue(pr, now)) return ['due', 'due'];
+  return null;
+}
+function deckStats(d, now) {
+  const its = itemsOf(d);
+  let due = 0, mastered = 0;
+  for (const [iid] of its) { const pr = progOf(d.id, iid); if (isDue(pr, now)) due++; if (isMastered(pr)) mastered++; }
+  return { total: its.length, due, mastered, masteredPct: its.length ? (mastered / its.length) * 100 : 0 };
 }
 // Weighted sampling without replacement (Efraimidis–Spirakis)
 function draw(items, k) {
@@ -228,34 +346,62 @@ function shuffle(a) {
   for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; }
   return a;
 }
+function streakInfo() {
+  const days = S.days || {};
+  const d = new Date(); d.setHours(12, 0, 0, 0);
+  const today = Number(days[dayKey(d)]) || 0;
+  if (!today) d.setDate(d.getDate() - 1);
+  let count = 0;
+  while (Number(days[dayKey(d)]) > 0) { count++; d.setDate(d.getDate() - 1); }
+  return { count, today };
+}
 
-async function createDeck({ name, kind, scope, visibility, items }) {
+async function createDeck({ name, kind, visibility, friendsCanEdit, allowPct, items }) {
   const ref = doc(collection(db, 'decks'));
-  await setDoc(ref, {
-    name: name.slice(0, 80), kind, scope,
-    visibility: scope === 'universal' ? 'shared' : (visibility === 'shared' ? 'shared' : 'private'),
+  const data = {
+    name: name.slice(0, 80), kind,
+    visibility: visibility === 'shared' ? 'shared' : 'private',
+    friendsCanEdit: visibility === 'shared' && !!friendsCanEdit,
+    allowPct: typeof allowPct === 'number' ? allowPct : DEFAULT_ALLOW[kind],
     ownerId: myUid(), ownerName: myName().slice(0, 60),
-    items: items || {}, createdAt: serverTimestamp(), updatedAt: serverTimestamp(),
-  });
-  // Show the new deck right away, even before the live listener catches up.
-  if (!S.decks.has(ref.id)) {
-    const d = normDeck(ref.id, { name, kind, scope, visibility: scope === 'universal' ? 'shared' : visibility, ownerId: myUid(), ownerName: myName(), items: items || {} });
+    items: items || {},
+  };
+  await setDoc(ref, { ...data, createdAt: serverTimestamp(), updatedAt: serverTimestamp() });
+  if (!S.decks.has(ref.id)) {   // show it right away, even before the live listener catches up
+    const d = normDeck(ref.id, data);
     S.pendingDecks.set(ref.id, d);
     S.decks.set(ref.id, d);
   }
   return ref.id;
 }
-function addItems(deckId, items) {
-  const patch = { updatedAt: serverTimestamp() };
+function itemsPatch(items, extra) {
+  const patch = { updatedAt: serverTimestamp(), ...(extra || {}) };
   for (const [id, it] of Object.entries(items)) patch['items.' + id] = it;
+  return patch;
+}
+const addItems = (deckId, items) => updateDoc(doc(db, 'decks', deckId), itemsPatch(items));
+function removeItems(deckId, ids) {
+  const patch = { updatedAt: serverTimestamp() };
+  for (const id of ids) patch['items.' + id] = deleteField();
   return updateDoc(doc(db, 'decks', deckId), patch);
+}
+
+// Older versions had "universal" decks. Turn them into shared decks once, from the admin's side.
+async function migrateLegacy() {
+  if (!S.isAdmin || migrated || !S.decksLoaded || !S.peopleLoaded) return;
+  migrated = true;
+  const legacy = [...S.decks.values()].filter(d => d.legacyUniversal);
+  if (!legacy.length) return;
+  const editors = [...S.people.entries()].some(([uid, p]) => uid !== S.adminUid && p.active === true && p.canEditUniversal === true);
+  for (const d of legacy) {
+    await save(updateDoc(doc(db, 'decks', d.id), { scope: deleteField(), visibility: 'shared', friendsCanEdit: editors, updatedAt: serverTimestamp() }));
+  }
 }
 
 // ---------------------------------------------------------------- boot and routing
 function configMissing() {
   return !firebaseConfig || !firebaseConfig.apiKey || /PASTE/i.test(String(firebaseConfig.apiKey) + String(firebaseConfig.projectId));
 }
-
 function boot() {
   if (configMissing()) { S.phase = 'config'; render(); return; }
   app = initializeApp(firebaseConfig);
@@ -283,7 +429,6 @@ function boot() {
     route();
   });
 }
-
 function route() {
   if (S.phase === 'config') return render();
   if (!S.metaLoaded || !S.authLoaded) { S.phase = 'loading'; return render(); }
@@ -305,7 +450,6 @@ function route() {
   S.phase = 'app';
   render();
 }
-
 function startUser(uid) {
   userUnsubs.push(onSnapshot(doc(db, 'users', uid), (s) => {
     if (!s.exists() && s.metadata.fromCache) return;
@@ -318,18 +462,16 @@ function startUser(uid) {
     if (S.phase === 'inactive') render();
   }, () => {}));
 }
-
 function ensureData() {
   const allowed = S.isAdmin || !!(S.me && S.me.active === true);
   if (allowed && !dataUnsubs) startData();
   if (!allowed && dataUnsubs) stopData();
 }
-
 function startData() {
   const uid = myUid();
   dataUnsubs = [];
   S.deckParts = {}; S.decksLoaded = false;
-  const expected = S.isAdmin ? 1 : 3;
+  const expected = S.isAdmin ? 1 : 2;
   const onErr = (e) => console.error(e);
   const part = (name) => (snap) => {
     const m = new Map();
@@ -345,17 +487,18 @@ function startData() {
   const decks = collection(db, 'decks');
   if (S.isAdmin) dataUnsubs.push(onSnapshot(decks, part('all'), onErr));
   else {
-    dataUnsubs.push(onSnapshot(query(decks, where('scope', '==', 'universal')), part('uni'), onErr));
     dataUnsubs.push(onSnapshot(query(decks, where('ownerId', '==', uid)), part('mine'), onErr));
     dataUnsubs.push(onSnapshot(query(decks, where('visibility', '==', 'shared')), part('shared'), onErr));
   }
   dataUnsubs.push(onSnapshot(doc(db, 'progress', uid), (s) => {
-    S.progress = (s.exists() && s.data().p) || {};
+    const d = s.exists() ? s.data() : {};
+    S.progress = d.p || {};
+    S.days = d.days || {};
     refresh();
   }, onErr));
   if (S.isAdmin) {
     dataUnsubs.push(onSnapshot(collection(db, 'users'), (snap) => {
-      const m = new Map(); snap.forEach(d => m.set(d.id, d.data())); S.people = m; refresh();
+      const m = new Map(); snap.forEach(d => m.set(d.id, d.data())); S.people = m; S.peopleLoaded = true; refresh();
     }, onErr));
     dataUnsubs.push(onSnapshot(collection(db, 'requests'), (snap) => {
       const m = new Map(); snap.forEach(d => m.set(d.id, d.data())); S.requests = m; refresh();
@@ -365,21 +508,26 @@ function startData() {
 function stopData() {
   if (dataUnsubs) dataUnsubs.forEach(u => u());
   dataUnsubs = null;
-  S.decks = new Map(); S.deckParts = {}; S.decksLoaded = false; S.pendingDecks = new Map(); S.progress = {}; S.people = new Map(); S.requests = new Map();
+  S.decks = new Map(); S.deckParts = {}; S.decksLoaded = false; S.pendingDecks = new Map();
+  S.progress = {}; S.days = {}; S.people = new Map(); S.peopleLoaded = false; S.requests = new Map();
 }
 function teardown() {
   userUnsubs.forEach(u => u()); userUnsubs = [];
   stopData();
   S.listenersFor = null; S.me = null; S.meLoaded = false; S.myRequest = null; S.isAdmin = false;
   S.session = null; S.view = 'study'; S.authShown = null;
-  S.dv = { open: null, q: '', editing: null, confirmItem: false, renaming: false, confirmDeck: false, creating: false, expanded: new Set() };
+  S.dv = freshDv();
   S.add = { kind: 'facts', deckId: null, chosen: false };
   S.pp = { renaming: null };
-  S.study = { kind: 'facts', sel: { facts: new Set(), poems: new Set() }, count: { facts: 10, poems: 1 } };
+  S.study = freshStudy();
+  migrated = false;
   mounted.study = mounted.add = mounted.people = mounted.account = false;
 }
-
-function refresh() { if (S.phase === 'app') renderApp(); }
+function refresh() {
+  if (S.phase !== 'app') return;
+  migrateLegacy();
+  renderApp();
+}
 
 // ---------------------------------------------------------------- top-level render
 function render() {
@@ -387,7 +535,6 @@ function render() {
   $('screen-loading').hidden = S.phase !== 'loading';
   $('screen-auth').hidden = !authPhase;
   $('screen-main').hidden = S.phase !== 'app';
-  if (S.phase !== 'app') document.title = 'Recall by Hand';
   if (S.phase === 'config') renderConfig();
   else if (S.phase === 'setup') renderSetupAdmin();
   else if (S.phase === 'signin') renderSignin();
@@ -399,8 +546,6 @@ function render() {
 function authForm(onsubmit, ...kids) {
   return h('form', { class: 'stack-sm', novalidate: true, onsubmit: (e) => { e.preventDefault(); onsubmit(); } }, ...kids);
 }
-function field(label, input) { return h('div', { class: 'field' }, h('label', { class: 'label', for: input.id, text: label }), input); }
-
 function renderConfig() {
   if (S.authShown === 'config') return; S.authShown = 'config';
   const msg = S.metaError
@@ -408,7 +553,6 @@ function renderConfig() {
     : 'Setup isn\'t finished. Paste your Firebase config into firebase-config.js, upload the files again, and reload this page.';
   put($('authBox'), h('h1', { text: 'Almost there' }), h('p', { text: msg }));
 }
-
 function renderSetupAdmin() {
   const variant = S.fbUser ? 'finish' : 'new';
   if (S.authShown === 'setup:' + variant) return; S.authShown = 'setup:' + variant;
@@ -419,7 +563,6 @@ function renderSetupAdmin() {
   const pw2 = h('input', { type: 'password', id: 'suPw2', autocomplete: 'new-password' });
   const btn = h('button', { type: 'submit', class: 'btn primary big' }, variant === 'new' ? 'Create admin account' : 'Finish setup');
   const fail = (m) => { status.className = 'status err'; status.textContent = m; btn.disabled = false; S.settingUp = false; };
-
   const submit = async () => {
     const n = name.value.trim();
     if (!n) return fail('Add your name.');
@@ -435,7 +578,7 @@ function renderSetupAdmin() {
         user = (await createUserWithEmailAndPassword(auth, e, pw.value)).user;
       }
       await setDoc(doc(db, 'meta', 'admin'), { uid: user.uid, name: n, createdAt: serverTimestamp() });
-      await setDoc(doc(db, 'users', user.uid), { name: n, email: user.email || '', active: true, canEditUniversal: true, createdAt: serverTimestamp() });
+      await setDoc(doc(db, 'users', user.uid), { name: n, email: user.email || '', active: true, createdAt: serverTimestamp() });
       S.settingUp = false;
       route();
     } catch (e) {
@@ -444,18 +587,19 @@ function renderSetupAdmin() {
       fail(c.includes('permission-denied') ? 'Someone else already set up this site. Sign in instead, or check your Firestore rules.' : authError(e));
     }
   };
-
   const kids = variant === 'new'
     ? [field('Your name', name), field('Email', email), field('Password (8+ characters)', pw), field('Password again', pw2)]
     : [field('Your name', name)];
-  put($('authBox'), 
+  put($('authBox'),
     h('h1', { text: 'Create the admin account' }),
-    h('p', { text: 'This first account runs the site: it creates everyone else\'s accounts, decides who can edit universal decks, and can see every deck.' }),
+    h('p', { text: 'This first account runs the site: it creates everyone else\'s accounts and can see every deck.' }),
     authForm(submit, ...kids, btn, status),
     S.fbUser ? h('button', { type: 'button', class: 'linkbtn quiet', onclick: () => signOut(auth) }, 'Sign out') : null
   );
 }
-
+function signinNote() {
+  return S.adminName ? `Accounts are made by ${S.adminName}. Ask them if you need one.` : 'Accounts are made by the admin. Ask them if you need one.';
+}
 function renderSignin() {
   if (S.authShown === 'signin') { const p = $('signinNote'); if (p) p.textContent = signinNote(); return; }
   S.authShown = 'signin';
@@ -475,17 +619,14 @@ function renderSignin() {
     try { await sendPasswordResetEmail(auth, e); status.className = 'status ok'; status.textContent = 'If that email has an account, a link to set a new password is on its way. Check spam too.'; }
     catch (err) { status.className = 'status err'; status.textContent = authError(err); }
   };
-  put($('authBox'), 
+  const showPw = h('button', { type: 'button', class: 'linkbtn quiet', onclick: () => { pw.type = pw.type === 'password' ? 'text' : 'password'; showPw.textContent = pw.type === 'password' ? 'Show password' : 'Hide password'; } }, 'Show password');
+  put($('authBox'),
     h('h1', { text: 'Sign in' }),
     h('p', { id: 'signinNote', text: signinNote() }),
-    authForm(submit, field('Email', email), field('Password', pw), btn, status),
+    authForm(submit, field('Email', email), field('Password', pw), h('div', null, showPw), btn, status),
     h('div', null, h('button', { type: 'button', class: 'linkbtn', onclick: forgot }, 'Forgot your password?'))
   );
 }
-function signinNote() {
-  return S.adminName ? `Accounts are made by ${S.adminName}. Ask them if you need one.` : 'Accounts are made by the admin. Ask them if you need one.';
-}
-
 function renderInactive() {
   const variant = S.me ? 'off' : (S.myRequest ? 'requested' : 'none');
   if (S.authShown === 'inactive:' + variant) return; S.authShown = 'inactive:' + variant;
@@ -507,7 +648,7 @@ function renderInactive() {
     try { await setDoc(doc(db, 'requests', myUid()), { name: n, email: S.fbUser.email || '', at: serverTimestamp() }); }
     catch (e) { status.className = 'status err'; status.textContent = dataError(e); }
   };
-  put($('authBox'), 
+  put($('authBox'),
     h('h1', { text: "You're signed in, but not added yet" }),
     h('p', { text: `Ask ${who} to let you in. Send a request and it will show up for them.` }),
     authForm(send, field('Your name', name), h('button', { type: 'submit', class: 'btn primary' }, 'Request access'), status),
@@ -520,18 +661,20 @@ const mounted = { study: false, add: false, people: false, account: false };
 
 function go(view) {
   S.view = view;
-  if (view === 'decks') { S.dv.editing = null; S.dv.renaming = false; S.dv.creating = false; }
+  if (view === 'decks') S.dv = freshDv();
   if (view === 'account') mounted.account = false;
   renderApp();
   window.scrollTo({ top: 0 });
 }
 function renderTop() {
   $('peopleTab').hidden = !S.isAdmin;
-  const n = S.isAdmin && S.requests.size ? ` (${S.requests.size})` : '';
-  $('peopleTab').textContent = 'People' + n;
+  $('peopleTab').textContent = 'People' + (S.isAdmin && S.requests.size ? ` (${S.requests.size})` : '');
   for (const b of document.querySelectorAll('.tab')) b.setAttribute('aria-selected', b.dataset.view === S.view ? 'true' : 'false');
   const who = $('whoBtn');
-  who.textContent = myName() + (S.isAdmin ? ' · admin' : '');
+  const nm = myName();
+  const initials = nm.split(/\s+/).filter(Boolean).slice(0, 2).map(w => w[0].toUpperCase()).join('') || '?';
+  put(who, h('span', { class: 'who-full', text: nm }), h('span', { class: 'who-short', text: initials, 'aria-hidden': 'true' }));
+  who.title = S.isAdmin ? 'Your account (admin)' : 'Your account';
   if (S.view === 'account') who.setAttribute('aria-current', 'page'); else who.removeAttribute('aria-current');
 }
 function renderApp() {
@@ -545,7 +688,7 @@ function renderApp() {
   else if (S.view === 'account') renderAccount();
 }
 
-// ---------------------------------------------------------------- study
+// ---------------------------------------------------------------- study: setup
 const curCount = () => S.study.count[S.study.kind];
 function setCount(n) {
   const k = S.study.kind;
@@ -557,9 +700,9 @@ function mountStudy() {
   const input = h('input', { type: 'number', inputmode: 'numeric', id: 'countInput', min: '1', 'aria-labelledby': 'countLabel' });
   input.addEventListener('input', () => { if (input.value !== '') setCount(input.value); });
   input.addEventListener('blur', () => { input.value = curCount(); });
-  put($('study-setup'), 
+  put($('study-setup'),
     h('div', { class: 'row', style: 'align-items:flex-start' },
-      h('div', { style: 'flex:1 1 18rem;min-width:0' }, h('h1', { text: 'Draw a set to write out' }), h('p', { class: 'lede', id: 'studyLede' })),
+      h('div', { style: 'flex:1 1 18rem;min-width:0' }, h('h1', { text: 'Draw a set to write out' }), h('p', { class: 'streak', id: 'streakLine' })),
       seg('studyKind', [['facts', 'Facts'], ['poems', 'Poems']], S.study.kind, (k) => { S.study.kind = k; savePrefs(); renderSetup(); })
     ),
     h('div', { id: 'studyLoading', class: 'block-note' }, h('p', { text: 'Loading your decks…' })),
@@ -576,18 +719,25 @@ function mountStudy() {
             input,
             h('button', { type: 'button', 'aria-label': 'One more', onclick: () => setCount(curCount() + 1) }, '+')),
           h('div', { class: 'presets', id: 'presets' }))),
+      h('div', { class: 'opts' },
+        h('div', null, h('span', { class: 'label', text: "How you'll answer" }),
+          seg('answerMode', [['paper', 'On paper'], ['type', 'Type it']], S.study.mode, (k) => { S.study.mode = k; savePrefs(); renderSetup(); }),
+          h('p', { class: 'help', id: 'modeHelp', style: 'margin-top:.45rem' })),
+        h('div', null, h('label', { class: 'label', for: 'allowSel', text: 'Allowed mistakes' }),
+          allowSelect('allowSel', S.study.allow, (v) => { S.study.allow = v; savePrefs(); renderSetup(); }, true),
+          h('p', { class: 'help', id: 'allowHelp', style: 'margin-top:.45rem' }))),
       h('dl', { class: 'stats', id: 'poolStats' }),
       h('div', { id: 'likelyWrap' }, h('span', { class: 'label', text: 'Most likely to come up' }), h('ul', { class: 'likely', id: 'likely' })),
-      h('div', null, h('button', { type: 'button', class: 'btn primary big', id: 'startBtn', onclick: startSession }, 'Draw')),
+      h('div', null, h('button', { type: 'button', class: 'btn primary big', id: 'startBtn', onclick: () => startSession() }, 'Draw')),
       h('details', { class: 'how' },
-        h('summary', { text: 'How picking works' }),
-        h('div', { class: 'formula', text: 'weight = (days since you last wrote it + 1) ÷ (times written + 1)' }),
-        h('p', { text: 'Each item gets a weight and the draw picks without repeats, so heavier items are more likely but nothing is guaranteed. Something you haven\'t touched in two months outweighs something you wrote yesterday, and something you\'ve written ten times weighs less than something you\'ve written once.' }),
-        h('p', { text: 'Items you\'ve never written count as at least 30 days overdue, so new additions come up early. Skipping doesn\'t count as studying. Your progress is your own: friends studying the same universal deck keep separate counts.' }))
+        h('summary', { text: 'How picking and checking work' }),
+        h('div', { class: 'formula', text: 'weight = (days since you last wrote it + 1) ÷ (times you got it right + 1)' }),
+        h('p', { text: 'Each item gets a weight and the draw picks without repeats, so heavier items are more likely but nothing is guaranteed. Items you\'ve never written count as at least 30 days overdue. Items you missed last time count as at least 14 days overdue, and they come back once more at the end of the same set (that retry is practice and isn\'t recorded).' }),
+        h('p', { text: 'Due: never written, missed last time, or longer ago than its spacing (1 day after the first right answer, then 2, 4, 8… up to 60 days). Mastered: right at least 3 times, including the last time.' }),
+        h('p', { text: 'Allowed mistakes: typed facts are compared letter by letter, typed poems word by word; capitals, accents and punctuation are ignored. On paper, poems ask how many lines you missed. You can always overrule a result.' }))
     )
   );
 }
-
 function renderStudy() {
   if (!mounted.study) mountStudy();
   const s = S.session;
@@ -598,18 +748,18 @@ function renderStudy() {
   else if (s.finished) renderDone();
   else renderCard();
 }
-
 function chip(label, n, on, onclick, extra, key, by) {
   return h('button', { type: 'button', class: 'chip' + (extra ? ' ' + extra : ''), 'aria-pressed': on ? 'true' : 'false', 'data-key': key, onclick },
     h('span', { class: 'nm', text: label }), by ? h('span', { class: 'by', text: 'by ' + by }) : null, h('span', { class: 'n', text: Number(n).toLocaleString() }));
 }
-
 function renderSetup() {
   const kind = S.study.kind;
   setSeg('studyKind', kind);
-  $('studyLede').textContent = kind === 'poems'
-    ? "Pick how many poems to write out in full. The ones you haven't written lately come up first."
-    : "Facts you haven't written in a while, or have written fewer times, are more likely to come up.";
+  setSeg('answerMode', S.study.mode);
+  const st = streakInfo();
+  put($('streakLine'),
+    st.count ? h('span', null, h('b', { text: String(st.count) }), ' day streak') : h('span', { text: 'Write something today to start a streak' }),
+    st.today ? h('span', null, h('b', { text: String(st.today) }), ' written today') : null);
   const decks = studyDecks(kind);
   const sel = S.study.sel[kind];
   const loading = !S.decksLoaded;
@@ -623,20 +773,16 @@ function renderSetup() {
     : 'No facts yet. Paste a batch and they will be ready to draw here.';
   if (loading || !all.length) return;
 
-  const groups = [['universal', 'Universal'], ['mine', 'Mine'], ['shared', 'Shared by friends']];
   const box = $('chipGroups');
   const toggle = (id) => { if (sel.has(id)) sel.delete(id); else sel.add(id); savePrefs(); renderSetup(); };
-  withFocus(box, () => {
-    put(box, 
-      h('div', { class: 'chips' }, chip(kind === 'poems' ? 'All poems' : 'All facts', all.length, sel.size === 0, () => { sel.clear(); savePrefs(); renderSetup(); }, 'pool', 'all')),
-      ...groups.map(([cat, label]) => {
-        const ds = decks.filter(d => category(d) === cat);
-        if (!ds.length) return null;
-        return h('div', { class: 'chip-group' }, h('h3', { text: label }),
-          h('div', { class: 'chips' }, ...ds.map(d => chip(d.name, itemsOf(d).length, sel.has(d.id), () => toggle(d.id), '', d.id, cat === 'shared' ? ownerLabel(d) : null))));
-      })
-    );
-  });
+  withFocus(box, () => put(box,
+    h('div', { class: 'chips' }, chip(kind === 'poems' ? 'All poems' : 'All facts', all.length, sel.size === 0, () => { sel.clear(); savePrefs(); renderSetup(); }, 'pool', 'all')),
+    ...[['mine', 'Mine'], ['shared', 'Shared by friends']].map(([cat, label]) => {
+      const ds = decks.filter(d => category(d) === cat);
+      if (!ds.length) return null;
+      return h('div', { class: 'chip-group' }, h('h3', { text: label }),
+        h('div', { class: 'chips' }, ...ds.map(d => chip(d.name, itemsOf(d).length, sel.has(d.id), () => toggle(d.id), '', d.id, cat === 'shared' ? ownerLabel(d) : null))));
+    })));
 
   const items = pool(kind, sel);
   const now = Date.now();
@@ -647,18 +793,25 @@ function renderSetup() {
   const presets = kind === 'poems' ? [1, 2, 3, 5] : [5, 10, 20, 40];
   put($('presets'), ...presets.map(n => h('button', { type: 'button', class: 'preset', 'aria-pressed': n === curCount() ? 'true' : 'false', onclick: () => setCount(n) }, String(n))));
 
-  let never = 0, gap = 0, recent = 0;
-  for (const x of items) {
-    const pr = progOf(x.deckId, x.itemId);
-    const t = pr ? Number(pr.t) || 0 : 0;
-    if (!t) never++; else { gap = Math.max(gap, (now - t) / DAY); if (now - t < DAY) recent++; }
-  }
-  const allNew = never === items.length;
-  put($('poolStats'), 
+  const paperFacts = S.study.mode === 'paper' && kind === 'facts';
+  $('modeHelp').textContent = S.study.mode === 'paper'
+    ? (kind === 'poems' ? 'Write it out, reveal it, then count the lines you missed.' : 'Write it out, reveal it, then mark Got it or Missed it.')
+    : 'Type your answer and the site checks it. You can overrule it.';
+  const allowSel = $('allowSel');
+  if (document.activeElement !== allowSel) allowSel.value = String(S.study.allow);
+  const deckAllows = [...new Set(decks.filter(d => !sel.size || sel.has(d.id)).map(d => d.allowPct))].sort((a, b) => a - b);
+  $('allowHelp').textContent = paperFacts
+    ? 'On paper, facts are simply right or wrong. This applies when you type.'
+    : (S.study.allow === 'deck'
+      ? (deckAllows.length === 1 ? `These decks allow ${deckAllows[0]}%.` : `These decks allow ${deckAllows.map(n => n + '%').join(', ')}.`)
+      : "Overrides each deck's standard for this set.");
+
+  let due = 0, mastered = 0;
+  for (const x of items) { const pr = progOf(x.deckId, x.itemId); if (isDue(pr, now)) due++; if (isMastered(pr)) mastered++; }
+  put($('poolStats'),
     h('div', null, h('dt', { text: 'In this pool' }), h('dd', { text: items.length.toLocaleString() })),
-    h('div', null, h('dt', { text: 'Never written out' }), h('dd', { text: never.toLocaleString() })),
-    h('div', null, h('dt', { text: allNew ? 'Written in last 24 h' : 'Longest gap' }), h('dd', { text: allNew ? String(recent) : spanDays(gap) }))
-  );
+    h('div', null, h('dt', { text: 'Due now' }), h('dd', { text: due.toLocaleString() })),
+    h('div', null, h('dt', { text: 'Mastered' }), h('dd', { text: items.length ? pct(mastered / items.length * 100) : '0%' })));
 
   const ranked = items.map(x => ({ x, w: weightOf(x.it, progOf(x.deckId, x.itemId), now) })).sort((a, b) => b.w - a.w).slice(0, 3);
   const maxW = ranked.length ? ranked[0].w : 1;
@@ -674,27 +827,53 @@ function renderSetup() {
   b.textContent = !items.length ? `No ${noun}s in these decks` : (items.length < curCount() ? `Draw all ${plural(items.length, noun)}` : `Draw ${plural(k, noun)}`);
 }
 
-function startSession() {
+// ---------------------------------------------------------------- study: session
+function startSession(refs) {
   const kind = S.study.kind;
-  const items = pool(kind, S.study.sel[kind]);
-  if (!items.length) return;
-  const picked = shuffle(draw(items, Math.min(curCount(), items.length))).map(x => ({ deckId: x.deckId, itemId: x.itemId }));
-  S.session = { kind, items: picked, i: 0, revealed: false, firstLine: false, finished: false, done: [], skipped: 0 };
+  let queue;
+  if (refs) queue = refs.map(r => ({ deckId: r.deckId, itemId: r.itemId, retry: false }));
+  else {
+    const items = pool(kind, S.study.sel[kind]);
+    if (!items.length) return;
+    queue = shuffle(draw(items, Math.min(curCount(), items.length))).map(x => ({ deckId: x.deckId, itemId: x.itemId, retry: false }));
+  }
+  S.session = { kind, mode: S.study.mode, allow: S.study.allow, queue, i: 0, phase: 'ask', hint: 0, typed: '', linesMissed: 0, check: null, override: null, results: [], undo: [], finished: false };
+  $('typeInput').value = '';
   renderStudy();
   window.scrollTo({ top: 0 });
-  $('revealBtn').focus({ preventScroll: true });
+  focusPrimary();
 }
 function currentItem() {
   const s = S.session;
-  while (s && s.i < s.items.length) {
-    const ref = s.items[s.i];
+  while (s && s.i < s.queue.length) {
+    const ref = s.queue[s.i];
     const d = S.decks.get(ref.deckId);
     const it = d && d.items[ref.itemId];
     if (it && typeof it === 'object') return { ref, d, it };
-    s.i++; s.revealed = false; s.firstLine = false;   // deleted mid-set
+    s.i++; resetCard(s);   // deleted mid-set
   }
   return null;
 }
+function resetCard(s) { s.phase = 'ask'; s.hint = 0; s.typed = ''; s.linesMissed = 0; s.check = null; s.override = null; }
+const allowFor = (s, d) => (s.allow === 'deck' ? d.allowPct : Number(s.allow));
+
+// The result after reveal or check: right/missed, and how far off when that applies.
+function outcome(s, d, it) {
+  const poem = s.kind === 'poems';
+  const allow = allowFor(s, d);
+  let right = null, off = null;
+  if (s.mode === 'type' && s.check) { off = s.check.off; right = off <= allow + 1e-9; }
+  else if (s.mode === 'paper' && poem) { const lines = Math.max(1, poemLines(it.text)); off = (s.linesMissed / lines) * 100; right = off <= allow + 1e-9; }
+  if (s.override != null) right = s.override;
+  return { right, off, allow };
+}
+function verdictText(o, overruled) {
+  const base = o.right
+    ? (o.off != null && o.off > 0 ? `Counts as right · ${pct(o.off)} off, ${o.allow}% allowed` : 'Right')
+    : `Counts as missed · ${pct(o.off || 0)} off, ${o.allow}% allowed`;
+  return base + (overruled ? ' (your call)' : '');
+}
+
 function renderCard() {
   const s = S.session;
   const cur = currentItem();
@@ -704,102 +883,241 @@ function renderCard() {
   const now = Date.now();
   const pr = progOf(ref.deckId, ref.itemId);
   const n = pr ? Number(pr.n) || 0 : 0;
-  $('sessProgress').textContent = `${s.i + 1} / ${s.items.length}`;
-  $('sessBar').style.width = `${Math.round(s.i / s.items.length * 100)}%`;
+  const shown = s.phase === 'shown';
+  const typed = s.mode === 'type';
+
+  $('sessProgress').textContent = `${s.i + 1} / ${s.queue.length}`;
+  $('sessBar').style.width = `${Math.round(s.i / s.queue.length * 100)}%`;
+  $('undoBtn').hidden = !s.undo.length;
   $('cardDeck').textContent = d.name;
-  $('cardMeta').textContent = n ? `written ${n}× · last ${ago(Number(pr.t), now)}` : 'first time';
+  $('cardMeta').textContent = ref.retry ? 'retry · practice only'
+    : (pr && Number(pr.t) ? `${lastMissed(pr) ? 'missed last time' : `right ${n}×`} · ${ago(Number(pr.t), now)}` : 'first time');
   $('cardPrompt').textContent = poem ? it.title : it.p;
   const by = $('cardByline');
   by.hidden = !poem;
   if (poem) by.textContent = [it.author ? 'by ' + it.author : '', plural(poemLines(it.text), 'line')].filter(Boolean).join(' · ');
-  $('cardHint').textContent = poem ? 'Write the whole poem from memory, then reveal it to check.' : 'Write the answer on paper, then reveal it.';
-  $('cardHint').hidden = s.revealed;
-  const fl = $('cardFirstLine');
-  fl.textContent = poem ? poemFirstLine(it.text) : '';
-  fl.hidden = !(poem && s.firstLine && !s.revealed);
-  $('firstLineBtn').hidden = !(poem && !s.revealed && !s.firstLine);
+
+  const hint = $('cardHint');
+  hint.hidden = shown;
+  hint.textContent = typed
+    ? (poem ? 'Type the whole poem from memory, then check it.' : 'Type the answer, then check it.')
+    : (poem ? 'Write the whole poem from memory, then reveal it to check.' : 'Write the answer on paper, then reveal it.');
+  const hl = $('cardHintLines');
+  hl.hidden = !(poem && !shown && s.hint > 0);
+  hl.textContent = s.hint === 1 ? poemFirstLine(it.text) : (s.hint === 2 ? poemFirstWords(it.text) : '');
+
   const ans = $('cardAnswer');
   const wasHidden = ans.hidden;
-  ans.textContent = poem ? it.text : it.a;
   ans.className = 'answer hand' + (poem ? ' poem' : '');
-  ans.hidden = !s.revealed;
-  if (s.revealed && wasHidden) { void ans.offsetWidth; ans.classList.add('show'); }
-  $('revealBtn').hidden = s.revealed;
-  $('revealBtn').textContent = poem ? 'Reveal the poem' : 'Reveal answer';
-  $('nextBtn').hidden = !s.revealed;
-  $('nextBtn').textContent = s.i + 1 >= s.items.length ? 'Written, finish set' : (poem ? 'Written, next poem' : 'Written, next fact');
+  if (shown && typed && s.check) put(ans, ...renderTokens(s.check.et, 'w-miss'));
+  else ans.textContent = poem ? it.text : it.a;
+  ans.hidden = !shown;
+  if (shown && wasHidden) { void ans.offsetWidth; ans.classList.add('show'); }
+
+  const tb = $('typeBox'), ti = $('typeInput');
+  tb.hidden = !(typed && !shown);
+  if (typed && !shown) {
+    ti.className = poem ? 'poem' : '';
+    ti.rows = poem ? 12 : 2;
+    $('typeLabel').textContent = poem ? 'Your poem' : 'Your answer';
+    if (ti.value !== s.typed) ti.value = s.typed;
+  }
+  const tc = $('typedCopy');
+  tc.hidden = !(shown && typed && s.check);
+  if (shown && typed && s.check) put($('typedText'), s.typed.trim() ? renderTokens(s.check.tt, 'w-extra') : h('em', { text: '(nothing typed)' }));
+
+  const vb = $('verdictBox');
+  vb.hidden = !shown || (!typed && !poem);
+  if (shown && (typed || poem)) {
+    const o = outcome(s, d, it);
+    const overruled = s.override != null;
+    const flip = h('button', { type: 'button', class: 'linkbtn', onclick: () => { s.override = overruled ? null : !o.right; renderCard(); } },
+      overruled ? 'Undo my call' : (o.right ? 'Count it as missed' : 'Count it as right'));
+    const line = h('div', { class: 'verdict ' + (o.right ? 'ok' : 'bad'), id: 'verdictLine' }, h('span', { text: verdictText(o, overruled) }), flip);
+    if (!typed && poem) {
+      const lines = poemLines(it.text);
+      const stepInput = h('input', { type: 'number', id: 'linesMissed', min: '0', max: String(lines), value: String(s.linesMissed), 'aria-label': 'Lines missed', inputmode: 'numeric' });
+      stepInput.addEventListener('input', () => { s.linesMissed = clampInt(stepInput.value, 0, lines, 0); s.override = null; renderVerdictOnly(); });
+      const bump = (dlt) => { s.linesMissed = clampInt(s.linesMissed + dlt, 0, lines, 0); s.override = null; stepInput.value = String(s.linesMissed); renderVerdictOnly(); };
+      put(vb, h('div', { class: 'stack-sm' },
+        h('div', { class: 'lines-missed' },
+          h('span', { class: 'label', style: 'margin:0', text: 'Lines I missed' }),
+          h('div', { class: 'stepper', role: 'group', 'aria-label': 'Lines missed' },
+            h('button', { type: 'button', 'aria-label': 'One fewer', onclick: () => bump(-1) }, '−'),
+            stepInput,
+            h('button', { type: 'button', 'aria-label': 'One more', onclick: () => bump(1) }, '+')),
+          h('span', { class: 'help', text: `of ${lines}` })),
+        line));
+    } else put(vb, line);
+  }
+
+  const left = [];
+  const right = [];
+  if (!shown) {
+    left.push(h('button', { type: 'button', class: 'linkbtn quiet', onclick: skip }, "Skip, don't count it"));
+    if (poem && s.hint < 2) left.push(h('button', { type: 'button', class: 'linkbtn', onclick: () => { s.hint++; renderCard(); } }, s.hint === 0 ? 'Hint: first line' : 'Hint: first words'));
+    right.push(h('button', { type: 'button', class: 'btn primary big', 'data-primary': '1', onclick: revealOrCheck }, typed ? 'Check' : (poem ? 'Reveal the poem' : 'Reveal answer')));
+  } else if (!typed && !poem) {
+    right.push(h('button', { type: 'button', class: 'btn miss big', onclick: () => commit(false) }, 'Missed it'));
+    right.push(h('button', { type: 'button', class: 'btn primary big', 'data-primary': '1', onclick: () => commit(true) }, 'Got it'));
+  } else {
+    const last = s.i + 1 >= s.queue.length;
+    right.push(h('button', { type: 'button', class: 'btn primary big', 'data-primary': '1', onclick: () => commit(outcome(s, d, it).right) }, last ? 'Finish set' : 'Next'));
+  }
+  put($('sessActions'), h('div', { class: 'row' }, ...left), h('div', { class: 'main' }, ...right));
+
+  const u = s.undo.length ? ' · U undo' : '';
+  $('keysHint').textContent = !shown
+    ? (typed ? (poem ? 'Ctrl/⌘ + Enter checks' : 'Enter checks') : 'Space reveals · S skips' + (poem ? ' · H hint' : '')) + u
+    : (!typed && !poem ? '← or 1 missed · → or 2 got it' : 'Enter next') + u;
 }
-function reveal() {
-  const s = S.session; if (!s || s.finished || s.revealed) return;
-  s.revealed = true; renderCard();
-  $('nextBtn').focus({ preventScroll: true });
+function renderVerdictOnly() {
+  const s = S.session; const cur = currentItem(); if (!cur) return;
+  const o = outcome(s, cur.d, cur.it);
+  const line = $('verdictLine'); if (!line) return;
+  line.className = 'verdict ' + (o.right ? 'ok' : 'bad');
+  line.firstChild.textContent = verdictText(o, false);
+  line.lastChild.textContent = o.right ? 'Count it as missed' : 'Count it as right';
 }
-function recordAndNext() {
-  const s = S.session; if (!s || s.finished || !s.revealed) return;
+function focusPrimary() {
+  const s = S.session; if (!s || s.finished) return;
+  if (s.mode === 'type' && s.phase === 'ask') { $('typeInput').focus({ preventScroll: true }); return; }
+  const b = $('sessActions').querySelector('[data-primary]');
+  if (b) b.focus({ preventScroll: true });
+}
+function revealOrCheck() {
+  const s = S.session; if (!s || s.finished || s.phase !== 'ask') return;
   const cur = currentItem(); if (!cur) return;
-  const key = progKey(cur.ref.deckId, cur.ref.itemId);
-  const pr = S.progress[key];
-  const n = (pr ? Number(pr.n) || 0 : 0) + 1;
-  save(setDoc(doc(db, 'progress', myUid()), { p: { [key]: { n, t: Date.now() } }, updatedAt: serverTimestamp() }, { merge: true }));
-  s.done.push(cur.ref);
+  if (s.mode === 'type') {
+    s.typed = $('typeInput').value;
+    const poem = s.kind === 'poems';
+    s.check = grade(poem ? cur.it.text : cur.it.a, s.typed, poem);
+  }
+  s.phase = 'shown';
+  renderCard();
+  focusPrimary();
+}
+function record(ref, right) {
+  const key = progKey(ref.deckId, ref.itemId);
+  const prev = S.progress[key] || null;
+  const day = dayKey();
+  const entry = {
+    n: (prev ? Number(prev.n) || 0 : 0) + (right ? 1 : 0),
+    m: (prev ? Number(prev.m) || 0 : 0) + (right ? 0 : 1),
+    t: Date.now(), r: right ? 1 : 0,
+  };
+  save(setDoc(doc(db, 'progress', myUid()), { p: { [key]: entry }, days: { [day]: increment(1) }, updatedAt: serverTimestamp() }, { merge: true }));
+  return { key, prev, day };
+}
+function snapshotSession(s) { const { undo: _u, ...rest } = s; return JSON.parse(JSON.stringify(rest)); }
+function commit(right) {
+  const s = S.session; if (!s || s.finished || s.phase !== 'shown') return;
+  const cur = currentItem(); if (!cur) return;
+  const snap = snapshotSession(s);
+  const o = outcome(s, cur.d, cur.it);
+  const write = cur.ref.retry ? null : record(cur.ref, right);
+  s.results.push({ deckId: cur.ref.deckId, itemId: cur.ref.itemId, retry: cur.ref.retry, right, off: o.off, hinted: s.hint > 0, overruled: s.override != null });
+  if (!right && !cur.ref.retry) s.queue.push({ deckId: cur.ref.deckId, itemId: cur.ref.itemId, retry: true });
+  s.undo.push({ snap, write });
   advance();
 }
-function skip() { const s = S.session; if (!s || s.finished) return; s.skipped++; advance(); }
+function skip() {
+  const s = S.session; if (!s || s.finished) return;
+  const cur = currentItem(); if (!cur) return;
+  const snap = snapshotSession(s);
+  s.results.push({ deckId: cur.ref.deckId, itemId: cur.ref.itemId, retry: cur.ref.retry, skipped: true });
+  s.undo.push({ snap, write: null });
+  advance();
+}
 function advance() {
   const s = S.session;
-  s.i++; s.revealed = false; s.firstLine = false;
-  if (s.i >= s.items.length) s.finished = true;
+  s.i++; resetCard(s);
+  $('typeInput').value = '';
+  if (s.i >= s.queue.length) s.finished = true;
   renderStudy();
-  if (!s.finished) $('revealBtn').focus({ preventScroll: true });
+  if (!s.finished) { window.scrollTo({ top: 0 }); focusPrimary(); }
   else { const a = $('againBtn'); if (a) a.focus({ preventScroll: true }); }
+}
+function undo() {
+  const s = S.session; if (!s || !s.undo.length) return;
+  const last = s.undo.pop();
+  if (last.write) {
+    const { key, prev, day } = last.write;
+    save(setDoc(doc(db, 'progress', myUid()), { p: { [key]: prev || deleteField() }, days: { [day]: increment(-1) }, updatedAt: serverTimestamp() }, { merge: true }));
+  }
+  const stack = s.undo;
+  S.session = Object.assign(last.snap, { undo: stack, finished: false });
+  $('typeInput').value = S.session.typed || '';
+  renderStudy();
+  window.scrollTo({ top: 0 });
+  focusPrimary();
 }
 function endSet() {
   const s = S.session; if (!s) return;
-  if (!s.done.length) { S.session = null; renderStudy(); return; }
+  if (!s.results.some(r => !r.skipped)) { S.session = null; renderStudy(); return; }
   s.finished = true; renderStudy();
 }
 function renderDone() {
   const s = S.session;
   const poem = s.kind === 'poems';
-  const n = s.done.length;
   const noun = poem ? 'poem' : 'fact';
-  const parts = [`You wrote out ${plural(n, noun)}`];
-  if (s.skipped) parts.push(`skipped ${s.skipped}`);
-  const left = s.items.length - n - s.skipped;
-  if (left > 0) parts.push(`left ${left} for next time`);
-  const rows = s.done.map(ref => {
-    const d = S.decks.get(ref.deckId); const it = d && d.items[ref.itemId];
+  const main = s.results.filter(r => !r.retry && !r.skipped);
+  const right = main.filter(r => r.right);
+  const missed = main.filter(r => !r.right);
+  const retries = new Map(s.results.filter(r => r.retry && !r.skipped).map(r => [r.deckId + '_' + r.itemId, r.right]));
+  const skipped = s.results.filter(r => r.skipped && !r.retry).length;
+  const lede = main.length
+    ? `${right.length} of ${main.length} right (${pct(right.length / main.length * 100)})` + (skipped ? `, ${skipped} skipped` : '') + '.'
+    : 'Nothing recorded.';
+  const row = (r) => {
+    const d = S.decks.get(r.deckId); const it = d && d.items[r.itemId];
     if (!it) return null;
-    return poem
-      ? h('li', null, h('span', { class: 'dp hand', text: it.title }), h('span', { class: 'da', text: [it.author, plural(poemLines(it.text), 'line')].filter(Boolean).join(' · ') }))
-      : h('li', null, h('span', { class: 'dp hand', text: it.p }), h('span', { class: 'da hand', text: it.a }));
-  }).filter(Boolean);
-  put($('study-done'), 
-    h('div', null, h('h1', { text: n ? 'Set finished' : 'Nothing recorded' }), h('p', { class: 'lede', text: parts.join(', ') + '.' })),
-    rows.length ? h('ul', { class: 'done-list' }, ...rows) : null,
+    const notes = [];
+    if (r.off != null && r.off > 0) notes.push(`${pct(r.off)} off`);
+    if (r.hinted) notes.push('used a hint');
+    if (r.overruled) notes.push('your call');
+    const rt = retries.get(r.deckId + '_' + r.itemId);
+    if (!r.right && rt != null) notes.push(rt ? 'right on retry' : 'missed on retry');
+    return h('li', null,
+      h('span', { class: 'dp hand', text: poem ? it.title : it.p }),
+      h('span', { class: 'da' + (poem ? '' : ' hand'), text: [poem ? (it.author || '') : it.a, ...notes].filter(Boolean).join(' · ') }));
+  };
+  put($('study-done'),
+    h('div', null,
+      h('h1', { text: main.length ? (missed.length ? 'Set finished' : 'Clean sweep') : 'Set ended' }),
+      h('p', { class: 'lede', text: lede })),
+    missed.length ? h('div', { class: 'deck-section' }, h('h3', { text: 'Missed' }), h('ul', { class: 'done-list' }, ...missed.map(row))) : null,
+    right.length ? h('div', { class: 'deck-section' }, h('h3', { text: 'Right' }), h('ul', { class: 'done-list' }, ...right.map(row))) : null,
     h('div', { class: 'row' },
-      h('button', { type: 'button', class: 'btn primary big', id: 'againBtn', onclick: () => { S.session = null; startSession(); } }, 'Draw another set'),
-      h('button', { type: 'button', class: 'btn ghost big', onclick: () => { S.session = null; renderStudy(); } }, 'Change decks or count'))
+      missed.length ? h('button', { type: 'button', class: 'btn primary big', id: 'againBtn', onclick: () => startSession(missed.map(r => ({ deckId: r.deckId, itemId: r.itemId }))) }, `Practice the ${plural(missed.length, 'miss', 'misses')} again`) : null,
+      h('button', { type: 'button', class: missed.length ? 'btn ghost big' : 'btn primary big', id: missed.length ? 'drawBtn' : 'againBtn', onclick: () => { S.session = null; startSession(); } }, 'Draw another set'),
+      h('button', { type: 'button', class: 'btn ghost big', onclick: () => { S.session = null; renderStudy(); } }, 'Change decks or count')),
+    s.undo.length ? h('div', null, h('button', { type: 'button', class: 'linkbtn quiet', onclick: undo }, `Undo the last ${noun}`)) : null
   );
 }
 
 // ---------------------------------------------------------------- decks
 function deckPills(d) {
-  const pills = [h('span', { class: 'pill kind', text: d.kind === 'poems' ? 'Poems' : 'Facts' })];
-  if (d.scope === 'universal') pills.push(h('span', { class: 'pill uni', text: 'Universal' }));
-  else pills.push(h('span', { class: 'pill ' + (d.visibility === 'shared' ? 'shared' : 'private'), text: d.visibility === 'shared' ? 'Shared' : 'Private' }));
-  return pills;
+  return [
+    h('span', { class: 'pill kind', text: d.kind === 'poems' ? 'Poems' : 'Facts' }),
+    h('span', { class: 'pill ' + (d.visibility === 'shared' ? 'shared' : 'private'), text: d.visibility === 'shared' ? 'Shared' : 'Private' }),
+    d.visibility === 'shared' && d.friendsCanEdit ? h('span', { class: 'pill edit', text: 'Friends can edit' }) : null,
+  ];
 }
-function deckRow(d, showOwner) {
-  const count = itemsOf(d).length;
+function deckRow(d, showOwner, now) {
+  const st = deckStats(d, now);
+  const studyable = category(d) !== 'other';
   return h('li', { class: 'deck-row' },
     h('div', { style: 'min-width:0' },
       h('button', { type: 'button', class: 'dn', onclick: () => openDeck(d.id) }, d.name),
-      h('div', { class: 'dm' }, ...deckPills(d), showOwner ? h('span', { text: 'by ' + ownerLabel(d) }) : null)),
-    h('span', { class: 'dc', text: plural(count, d.kind === 'poems' ? 'poem' : 'fact') }));
+      h('div', { class: 'dm' }, ...deckPills(d), showOwner ? h('span', { text: 'by ' + ownerLabel(d) }) : null,
+        h('span', { text: plural(st.total, d.kind === 'poems' ? 'poem' : 'fact') + (studyable && st.total ? ` · ${st.due} due` : '') }))),
+    studyable && st.total ? h('div', { class: 'mastery', title: 'Mastered: right at least 3 times, including the last time' },
+      h('span', { class: 'bar', 'aria-hidden': 'true' }, h('i', { style: `width:${Math.round(st.masteredPct)}%` })),
+      h('span', { class: 'mono', text: pct(st.masteredPct) + ' mastered' })) : h('span'));
 }
 function openDeck(id) {
-  Object.assign(S.dv, { open: id, q: '', editing: null, confirmItem: false, renaming: false, confirmDeck: false, expanded: new Set() });
+  S.dv = { ...freshDv(), open: id };
   renderDecks(true);
   window.scrollTo({ top: 0 });
 }
@@ -810,90 +1128,93 @@ function renderDecks(force) {
   if (S.dv.open && S.decks.has(S.dv.open)) return renderDeckDetail(root);
   S.dv.open = null;
 
+  const now = Date.now();
   const all = sortDecks([...S.decks.values()]);
   const sec = (title, list, empty, showOwner) => h('div', { class: 'deck-section' }, h('h3', { text: title }),
-    list.length ? h('ul', { class: 'deck-list' }, ...list.map(d => deckRow(d, showOwner))) : h('p', { class: 'empty-line', text: empty }));
-  const sections = [
-    sec('Universal decks', all.filter(d => d.scope === 'universal'), canEditUniversal() ? 'No universal decks yet. Make one with New deck.' : 'No universal decks yet.', true),
-    sec('My decks', all.filter(d => category(d) === 'mine'), 'You have no decks of your own yet.', false),
-  ];
+    list.length ? h('ul', { class: 'deck-list' }, ...list.map(d => deckRow(d, showOwner, now))) : h('p', { class: 'empty-line', text: empty }));
+  const sections = [sec('My decks', all.filter(d => category(d) === 'mine'), 'You have no decks yet. Make one with New deck.', false)];
   if (S.isAdmin) {
-    const others = all.filter(d => d.scope === 'personal' && d.ownerId !== myUid());
+    const others = all.filter(d => d.ownerId !== myUid());
     const byOwner = new Map();
     for (const d of others) { if (!byOwner.has(d.ownerId)) byOwner.set(d.ownerId, []); byOwner.get(d.ownerId).push(d); }
     const groups = [...byOwner.entries()].sort((a, b) => ownerLabel(a[1][0]).localeCompare(ownerLabel(b[1][0])));
     sections.push(h('div', { class: 'deck-section' }, h('h3', { text: "Everyone else's decks" }),
       groups.length ? h('div', null, ...groups.map(([, ds]) => h('div', { class: 'owner-group' },
         h('span', { class: 'owner-name', text: ownerLabel(ds[0]) }),
-        h('ul', { class: 'deck-list' }, ...ds.map(d => deckRow(d, false))))))
+        h('ul', { class: 'deck-list' }, ...ds.map(d => deckRow(d, false, now))))))
         : h('p', { class: 'empty-line', text: 'Nobody else has made a deck yet.' })));
   } else {
     sections.push(sec('Shared by friends', all.filter(d => category(d) === 'shared'), 'When friends share one of their decks, it shows up here.', true));
   }
-
-  put(root, 
+  put(root,
     h('div', { class: 'row', style: 'align-items:flex-start' },
       h('div', { style: 'flex:1 1 18rem;min-width:0' }, h('h1', { text: 'Decks' }),
-        h('p', { class: 'lede', text: S.isAdmin ? 'Universal decks everyone studies, your own, and every deck your friends have made.' : 'Universal decks everyone studies, your own, and the ones friends share.' })),
+        h('p', { class: 'lede', text: S.isAdmin ? 'Your decks, and every deck your friends have made.' : 'Your decks, and the ones friends share with you.' })),
       h('button', { type: 'button', class: 'btn primary', onclick: () => { S.dv.creating = true; renderDecks(true); const n = $('ndName'); if (n) n.focus(); } }, 'New deck')),
     S.dv.creating ? newDeckBox() : null,
-    ...sections
-  );
+    ...sections);
 }
-
 function newDeckBox() {
   const name = h('input', { type: 'text', id: 'ndName', maxlength: '80', placeholder: 'e.g. Poems we love', autocomplete: 'off' });
-  let kind = 'facts', scope = canEditUniversal() ? 'universal' : 'personal';
-  const share = h('input', { type: 'checkbox', id: 'ndShare' });
-  const shareRow = h('label', { class: 'check', for: 'ndShare' }, share, h('span', { text: 'Let friends see and study it (they can\'t change it)' }));
+  let kind = 'facts';
+  let allowTouched = false;
   const status = h('p', { class: 'status', role: 'status' });
-  const radio = (group, value, label, checked, on) => {
-    const id = `nd-${group}-${value}`;
-    const r = h('input', { type: 'radio', name: 'nd-' + group, id, value, checked });
-    r.addEventListener('change', () => on(value));
+  const edit = check('ndEdit', 'Friends can edit it too', false);
+  const share = check('ndShare', 'Share with friends', true, (v) => { edit.hidden = !v; });
+  const allowSel = allowSelect('ndAllow', DEFAULT_ALLOW.facts, () => { allowTouched = true; });
+  const radio = (value, label, checked) => {
+    const id = 'nd-kind-' + value;
+    const r = h('input', { type: 'radio', name: 'nd-kind', id, value, checked });
+    r.addEventListener('change', () => { kind = value; if (!allowTouched) allowSel.value = String(DEFAULT_ALLOW[kind]); });
     return h('label', { class: 'check', for: id }, r, h('span', { text: label }));
   };
-  const sync = () => { shareRow.hidden = scope !== 'personal'; };
   const close = () => { S.dv.creating = false; renderDecks(true); };
   const create = async () => {
     const n = name.value.trim();
     if (!n) { status.className = 'status err'; status.textContent = 'Give the deck a name.'; name.focus(); return; }
     status.className = 'status'; status.textContent = 'Creating…';
     try {
-      const id = await createDeck({ name: n, kind, scope, visibility: share.checked ? 'shared' : 'private' });
+      const shared = $('ndShare').checked;
+      const id = await createDeck({ name: n, kind, visibility: shared ? 'shared' : 'private', friendsCanEdit: shared && $('ndEdit').checked, allowPct: Number(allowSel.value) });
       S.dv.creating = false;
       S.add = { kind, deckId: id, chosen: true };
       toast(`Created ${n}. Add to it here.`);
       go('add');
     } catch (e) { status.className = 'status err'; status.textContent = dataError(e); }
   };
-  const box = h('div', { class: 'panel-box' },
+  name.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); create(); } });
+  return h('div', { class: 'panel-box' },
     h('h2', { text: 'New deck' }),
     field('Name', name),
     h('div', { class: 'field' }, h('span', { class: 'label', text: 'Holds' }),
-      h('div', { class: 'radios' }, radio('kind', 'facts', 'Facts (prompt and answer)', true, v => { kind = v; }), radio('kind', 'poems', 'Poems (written out whole)', false, v => { kind = v; }))),
-    h('div', { class: 'field' }, h('span', { class: 'label', text: 'Who it\'s for' }),
-      h('div', { class: 'radios' },
-        canEditUniversal() ? radio('scope', 'universal', 'Universal: everyone studies it', true, v => { scope = v; sync(); }) : null,
-        radio('scope', 'personal', 'Just me', !canEditUniversal(), v => { scope = v; sync(); }))),
-    shareRow,
+      h('div', { class: 'radios' }, radio('facts', 'Facts (prompt and answer)', true), radio('poems', 'Poems (written out whole)', false))),
+    h('div', { class: 'stack-sm' }, share, edit),
+    h('div', { class: 'field' }, h('label', { class: 'label', for: 'ndAllow', text: 'Allowed mistakes (standard)' }), allowSel),
     h('div', { class: 'row' }, h('button', { type: 'button', class: 'btn primary', onclick: create }, 'Create deck'), h('button', { type: 'button', class: 'btn ghost', onclick: close }, 'Cancel')),
     status);
-  name.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); create(); } });
-  sync();
-  return box;
 }
-
+function deckSettings(d) {
+  const ref = doc(db, 'decks', d.id);
+  const shared = d.visibility === 'shared';
+  return h('div', { class: 'settings' },
+    check('dsShare', 'Share with friends', shared, (v) => save(updateDoc(ref, { visibility: v ? 'shared' : 'private', ...(v ? {} : { friendsCanEdit: false }), updatedAt: serverTimestamp() }),
+      v ? 'Friends can now see and study this deck.' : 'This deck is private again.')),
+    check('dsEdit', 'Friends can edit it too (add, change and delete items)', shared && d.friendsCanEdit, (v) => save(updateDoc(ref, { friendsCanEdit: v, updatedAt: serverTimestamp() }),
+      v ? 'Friends can now edit this deck.' : 'Only you can edit this deck now.'), !shared),
+    h('div', { class: 'row' }, h('label', { class: 'label', for: 'dsAllow', style: 'margin:0', text: 'Allowed mistakes' }),
+      allowSelect('dsAllow', d.allowPct, (v) => save(updateDoc(ref, { allowPct: v, updatedAt: serverTimestamp() }), `Standard set to ${v}%.`))));
+}
 function renderDeckDetail(root) {
   const d = S.decks.get(S.dv.open);
   const dv = S.dv;
-  const write = canWrite(d);
+  const manage = canManage(d);
+  const editItems = canEditItems(d);
   const poem = d.kind === 'poems';
+  const noun = poem ? 'poem' : 'fact';
   const now = Date.now();
   const items = itemsOf(d);
-  const neverN = items.filter(([iid]) => !progOf(d.id, iid)).length;
+  const st = deckStats(d, now);
 
-  // header
   let actions;
   if (dv.renaming) {
     const inp = h('input', { type: 'text', id: 'renameInput', maxlength: '80', 'aria-label': 'Deck name', value: d.name });
@@ -910,7 +1231,7 @@ function renderDeckDetail(root) {
     setTimeout(() => inp.focus(), 0);
   } else if (dv.confirmDeck) {
     actions = h('div', { class: 'confirm' },
-      h('span', { text: `Delete ${d.name} and its ${plural(items.length, poem ? 'poem' : 'fact')}${d.scope === 'universal' ? ' for everyone' : ''}?` }),
+      h('span', { text: `Delete ${d.name} and its ${plural(items.length, noun)}${d.visibility === 'shared' ? ' for everyone' : ''}?` }),
       h('button', { type: 'button', class: 'btn danger', onclick: async () => {
         dv.confirmDeck = false; dv.open = null;
         await save(deleteDoc(doc(db, 'decks', d.id)), `Deleted ${d.name}.`);
@@ -918,34 +1239,28 @@ function renderDeckDetail(root) {
       } }, 'Delete deck'),
       h('button', { type: 'button', class: 'btn ghost', onclick: () => { dv.confirmDeck = false; renderDecks(true); } }, 'Keep it'));
   } else {
-    const shareToggle = d.scope === 'personal' && write
-      ? (() => {
-          const cb = h('input', { type: 'checkbox', id: 'deckShare', checked: d.visibility === 'shared' });
-          cb.addEventListener('change', () => save(updateDoc(doc(db, 'decks', d.id), { visibility: cb.checked ? 'shared' : 'private', updatedAt: serverTimestamp() }),
-            cb.checked ? 'Friends can now see and study this deck.' : 'This deck is private again.'));
-          return h('label', { class: 'check', for: 'deckShare' }, cb, h('span', { text: 'Let friends see and study it' }));
-        })()
-      : null;
-    actions = h('div', { class: 'stack-sm', style: 'justify-items:start' },
+    actions = h('div', { class: 'stack-sm', style: 'justify-items:start;width:100%' },
       h('div', { class: 'row' },
-        category(d) !== 'other' ? h('button', { type: 'button', class: 'btn primary', onclick: () => { S.study.kind = d.kind; S.study.sel[d.kind] = new Set([d.id]); savePrefs(); S.session = null; go('study'); } }, 'Study this deck') : null,
-        write ? h('button', { type: 'button', class: 'btn ghost', onclick: () => { S.add = { kind: d.kind, deckId: d.id, chosen: true }; go('add'); } }, poem ? 'Add a poem' : 'Add facts') : null),
-      shareToggle,
-      write ? h('div', { class: 'row' },
+        category(d) !== 'other' && items.length ? h('button', { type: 'button', class: 'btn primary', onclick: () => { S.study.kind = d.kind; S.study.sel[d.kind] = new Set([d.id]); savePrefs(); S.session = null; go('study'); } }, 'Study this deck') : null,
+        editItems ? h('button', { type: 'button', class: 'btn ghost', onclick: () => { S.add = { kind: d.kind, deckId: d.id, chosen: true }; go('add'); } }, poem ? 'Add a poem' : 'Add facts') : null),
+      manage ? deckSettings(d) : null,
+      manage ? h('div', { class: 'row' },
         h('button', { type: 'button', class: 'linkbtn', onclick: () => { dv.renaming = true; renderDecks(true); } }, 'Rename'),
         h('button', { type: 'button', class: 'linkbtn warn', onclick: () => { dv.confirmDeck = true; renderDecks(true); } }, 'Delete deck')) : null);
   }
 
+  const metaBits = [plural(st.total, noun)];
+  if (category(d) !== 'other' && st.total) metaBits.push(`${st.due} due for you`, `${pct(st.masteredPct)} mastered`);
+  if (!manage) metaBits.push(`${d.allowPct}% mistakes allowed`);
   const head = h('div', { class: 'deck-head' },
     h('div', { class: 'title' },
       h('h1', { text: d.name }),
-      h('div', { class: 'meta' }, ...deckPills(d),
-        h('span', { text: d.ownerId === myUid() ? 'yours' : 'by ' + ownerLabel(d) }),
-        h('span', { text: `· ${plural(items.length, poem ? 'poem' : 'fact')} · ${neverN} you haven't written yet` })),
-      !write ? h('p', { class: 'help', text: d.scope === 'universal' ? 'Only people with permission can change universal decks.' : 'You can study this deck, but only its owner can change it.' }) : null),
+      h('div', { class: 'meta' }, ...deckPills(d), h('span', { text: d.ownerId === myUid() ? 'yours' : 'by ' + ownerLabel(d) })),
+      h('p', { class: 'help', text: metaBits.join(' · ') }),
+      !editItems ? h('p', { class: 'help', text: 'You can study this deck, but only its owner can change it.' })
+        : (!manage ? h('p', { class: 'help', text: `${ownerLabel(d)} lets friends add to and edit this deck.` }) : null)),
     actions);
 
-  // list
   const q = norm(dv.q);
   let rows = items.map(([iid, it]) => ({ iid, it, pr: progOf(d.id, iid) }));
   if (q) rows = rows.filter(r => poem
@@ -955,54 +1270,105 @@ function renderDeckDetail(root) {
   rows.sort((a, b) => b.w - a.w);
   const maxW = rows.length ? rows[0].w : 1;
   const shown = rows.slice(0, MAX_LIST);
+  for (const id of [...dv.picked]) if (!d.items[id]) dv.picked.delete(id);
 
-  const search = h('input', { type: 'search', id: 'deckSearch', placeholder: poem ? 'Search titles, poets and lines' : 'Search prompts and answers', 'aria-label': 'Search this deck', autocomplete: 'off', value: dv.q });
-  let st = 0;
-  search.addEventListener('input', () => { clearTimeout(st); st = setTimeout(() => { dv.q = search.value; dv.editing = null; renderDecks(true); const s2 = $('deckSearch'); if (s2) { s2.focus(); s2.setSelectionRange(s2.value.length, s2.value.length); } }, 150); });
+  const search = h('input', { type: 'search', id: 'deckSearch', placeholder: 'Search this deck', 'aria-label': 'Search this deck', autocomplete: 'off', value: dv.q });
+  let tmr = 0;
+  search.addEventListener('input', () => { clearTimeout(tmr); tmr = setTimeout(() => { dv.q = search.value; dv.editing = null; renderDecks(true); const s2 = $('deckSearch'); if (s2) { s2.focus(); s2.setSelectionRange(s2.value.length, s2.value.length); } }, 150); });
   const fallback = h('textarea', { readonly: true, hidden: true, 'aria-label': 'Deck as text', class: 'data' });
   const copyBtn = h('button', { type: 'button', class: 'btn ghost', onclick: () => {
     const text = poem
       ? items.map(([, it]) => `${it.title}${it.author ? ' — ' + it.author : ''}\n\n${it.text}`).join('\n\n---\n\n')
       : items.map(([, it]) => `${it.p} | ${String(it.a).replace(/\r?\n/g, ' ')}`).join('\n');
-    copyText(text, fallback, `Copied ${plural(items.length, poem ? 'poem' : 'fact')}.`);
-  } }, 'Copy as text');
+    copyText(text, fallback, `Copied ${plural(items.length, noun)}.`);
+  } }, 'Copy');
+  const selectBtn = editItems && items.length ? h('button', { type: 'button', class: 'btn ghost', 'aria-pressed': dv.selecting ? 'true' : 'false', onclick: () => { dv.selecting = !dv.selecting; dv.picked = new Set(); dv.editing = null; renderDecks(true); } }, dv.selecting ? 'Done' : 'Select') : null;
 
-  put(root, 
-    h('div', null, h('button', { type: 'button', class: 'linkbtn quiet', onclick: () => { dv.open = null; renderDecks(true); } }, '← All decks')),
+  put(root,
+    h('div', null, h('button', { type: 'button', class: 'linkbtn quiet', onclick: () => { S.dv = freshDv(); renderDecks(true); } }, '← All decks')),
     head,
-    items.length ? h('div', { class: 'tools' }, search, copyBtn) : null,
+    items.length ? h('div', { class: 'tools', style: 'grid-template-columns:minmax(0,1fr) auto auto' }, search, selectBtn || h('span'), copyBtn) : null,
     fallback,
     h('p', { class: 'list-note', text: rows.length
-      ? `${plural(rows.length, poem ? 'poem' : 'fact')}${q ? ' match' : ''}, most likely to come up for you first${rows.length > shown.length ? `. Showing the first ${MAX_LIST}; search to narrow.` : '.'}`
-      : (q ? 'Nothing matches that search.' : (poem ? 'No poems in this deck yet.' : 'No facts in this deck yet.')) }),
-    shown.length ? h('ul', { class: 'items' }, ...shown.map(r => itemRow(d, r, maxW, now, write))) : null
-  );
+      ? `${plural(rows.length, noun)}${q ? ' match' : ''}, most likely to come up for you first${rows.length > shown.length ? `. Showing the first ${MAX_LIST}; search to narrow.` : '.'}`
+      : (q ? 'Nothing matches that search.' : `No ${noun}s in this deck yet.`) }),
+    shown.length ? h('ul', { class: 'items' }, ...shown.map(r => itemRow(d, r, maxW, now, editItems))) : null,
+    dv.selecting ? selectionBar(d, shown) : null);
 }
-
-function itemRow(d, r, maxW, now, write) {
+function deleteItemsWithUndo(d, ids) {
+  const backup = {};
+  for (const id of ids) if (d.items[id]) backup[id] = d.items[id];
+  const keys = Object.keys(backup);
+  if (!keys.length) return;
+  const noun = d.kind === 'poems' ? 'poem' : 'fact';
+  const first = backup[keys[0]];
+  const label = keys.length === 1 ? `Deleted “${d.kind === 'poems' ? first.title : first.p}”.` : `Deleted ${plural(keys.length, noun)}.`;
+  save(removeItems(d.id, keys), label, { label: 'Undo', run: () => save(addItems(d.id, backup), 'Restored.') });
+}
+function selectionBar(d, shown) {
+  const dv = S.dv;
+  const n = dv.picked.size;
+  const noun = d.kind === 'poems' ? 'poem' : 'fact';
+  const targets = sortDecks([...S.decks.values()].filter(x => x.id !== d.id && x.kind === d.kind && canEditItems(x)));
+  const move = h('select', { id: 'moveTo', 'aria-label': 'Move to deck' },
+    h('option', { value: '', text: 'Move to…' }), ...targets.map(t => h('option', { value: t.id, text: t.name + (t.ownerId !== myUid() ? ` (${ownerLabel(t)})` : '') })));
+  move.disabled = !n || !targets.length;
+  move.addEventListener('change', async () => {
+    const target = S.decks.get(move.value); if (!target) return;
+    const ids = [...dv.picked].filter(id => d.items[id]);
+    const moving = {}; for (const id of ids) moving[id] = d.items[id];
+    if (bytes(Object.assign({}, target.items, moving)) > MAX_DECK_BYTES) { toast(`${target.name} doesn't have room for these.`); move.value = ''; return; }
+    const batch = writeBatch(db);
+    batch.update(doc(db, 'decks', target.id), itemsPatch(moving));
+    const del = { updatedAt: serverTimestamp() }; for (const id of ids) del['items.' + id] = deleteField();
+    batch.update(doc(db, 'decks', d.id), del);
+    const ok = await save(batch.commit(), `Moved ${plural(ids.length, noun)} to ${target.name}.`);
+    if (ok) {
+      const p = {};
+      for (const id of ids) { const pr = progOf(d.id, id); if (pr) { p[progKey(target.id, id)] = pr; p[progKey(d.id, id)] = deleteField(); } }
+      if (Object.keys(p).length) save(setDoc(doc(db, 'progress', myUid()), { p, updatedAt: serverTimestamp() }, { merge: true }));
+    }
+    dv.picked = new Set(); renderDecks(true);
+  });
+  const allIds = shown.map(r => r.iid);
+  const allOn = allIds.length > 0 && allIds.every(id => dv.picked.has(id));
+  return h('div', { class: 'selbar', role: 'region', 'aria-label': 'Selected items' },
+    h('span', { text: n ? `${n} selected` : `Pick ${noun}s below` }),
+    h('button', { type: 'button', class: 'linkbtn', onclick: () => { dv.picked = allOn ? new Set() : new Set(allIds); renderDecks(true); } }, allOn ? 'Clear' : 'Select all'),
+    h('span', { class: 'spacer' }),
+    move,
+    h('button', { type: 'button', class: 'btn danger', disabled: !n, onclick: () => { const ids = [...dv.picked]; dv.picked = new Set(); deleteItemsWithUndo(d, ids); } }, 'Delete'));
+}
+function itemRow(d, r, maxW, now, editItems) {
   const dv = S.dv;
   const poem = d.kind === 'poems';
   if (dv.editing === r.iid) return itemEditRow(d, r);
   const n = r.pr ? Number(r.pr.n) || 0 : 0;
   const open = dv.expanded.has(r.iid);
+  const status = category(d) !== 'other' ? statusOf(r.pr, now) : null;
+  const label = poem ? r.it.title : r.it.p;
   const side = h('div', { class: 'item-side' },
-    n ? h('span', { class: 'mono', text: `${n}× · ${ago(Number(r.pr.t), now)}` }) : h('span', { class: 'pill new', text: 'new' }),
+    h('div', { class: 'row', style: 'justify-content:flex-end;gap:.4rem' },
+      status ? h('span', { class: 'pill ' + status[0], text: status[1] }) : null,
+      r.pr && Number(r.pr.t) ? h('span', { class: 'mono', text: (n ? `right ${n}× · ` : '') + ago(Number(r.pr.t), now) }) : null),
     h('span', { class: 'bar', title: 'How likely it is to come up for you', 'aria-hidden': 'true' }, h('i', { style: `width:${Math.max(4, Math.round(r.w / maxW * 100))}%` })),
-    h('div', { class: 'row', style: 'justify-content:flex-end;gap:.75rem' },
+    !dv.selecting ? h('div', { class: 'row', style: 'justify-content:flex-end;gap:.85rem' },
       poem ? h('button', { type: 'button', class: 'linkbtn', 'aria-expanded': open ? 'true' : 'false', onclick: () => { if (open) dv.expanded.delete(r.iid); else dv.expanded.add(r.iid); renderDecks(true); } }, open ? 'Hide' : 'Read') : null,
-      write ? h('button', { type: 'button', class: 'linkbtn', onclick: () => { dv.editing = r.iid; dv.confirmItem = false; renderDecks(true); const f = $('edit1'); if (f) f.focus(); } }, 'Edit') : null));
+      editItems ? h('button', { type: 'button', class: 'linkbtn', onclick: () => { dv.editing = r.iid; renderDecks(true); const f = $('edit1'); if (f) f.focus(); } }, 'Edit') : null,
+      editItems ? h('button', { type: 'button', class: 'linkbtn warn', 'aria-label': `Delete ${label}`, onclick: () => deleteItemsWithUndo(d, [r.iid]) }, 'Delete') : null) : null);
   const main = poem
     ? h('div', { style: 'min-width:0' }, h('p', { class: 'item-p', text: r.it.title }),
         h('p', { class: 'item-sub', text: [r.it.author ? 'by ' + r.it.author : '', plural(poemLines(r.it.text), 'line')].filter(Boolean).join(' · ') }),
         !open ? h('p', { class: 'item-a hand', text: poemFirstLine(r.it.text) + ' …' }) : null)
     : h('div', { style: 'min-width:0' }, h('p', { class: 'item-p', text: r.it.p }), h('p', { class: 'item-a hand', text: r.it.a }));
-  return h('li', { class: 'item' }, main, side, poem && open ? h('pre', { class: 'poem-full', text: r.it.text }) : null);
+  const pick = dv.selecting ? h('input', { type: 'checkbox', class: 'pick', checked: dv.picked.has(r.iid), 'aria-label': `Select ${label}`, 'data-key': 'pick-' + r.iid,
+    onchange: (e) => { if (e.target.checked) dv.picked.add(r.iid); else dv.picked.delete(r.iid); const root = $('view-decks'); withFocus(root, () => renderDecks(true)); } }) : null;
+  return h('li', { class: 'item' + (dv.selecting ? ' sel-mode' : '') }, pick, main, side, poem && open ? h('pre', { class: 'poem-full', text: r.it.text }) : null);
 }
-
 function itemEditRow(d, r) {
   const dv = S.dv;
   const poem = d.kind === 'poems';
-  const close = () => { dv.editing = null; dv.confirmItem = false; renderDecks(true); };
+  const close = () => { dv.editing = null; renderDecks(true); };
   let f1, f2, f3;
   if (poem) {
     f1 = h('input', { type: 'text', id: 'edit1', maxlength: '200', value: r.it.title });
@@ -1024,14 +1390,8 @@ function itemEditRow(d, r) {
       next = { p, a, c: Number(r.it.c) || Date.now() };
     }
     close();
-    await save(updateDoc(doc(db, 'decks', d.id), { ['items.' + r.iid]: next, updatedAt: serverTimestamp() }), 'Saved.');
+    await save(addItems(d.id, { [r.iid]: next }), 'Saved.');
   };
-  const delBtn = h('button', { type: 'button', class: 'btn ghost' }, poem ? 'Delete poem' : 'Delete fact');
-  delBtn.addEventListener('click', async () => {
-    if (!dv.confirmItem) { dv.confirmItem = true; delBtn.textContent = 'Yes, delete it'; delBtn.className = 'btn danger'; return; }
-    close();
-    await save(updateDoc(doc(db, 'decks', d.id), { ['items.' + r.iid]: deleteField(), updatedAt: serverTimestamp() }), 'Deleted.');
-  });
   const fields = poem
     ? [h('div', { class: 'grid-2' }, field('Title', f1), field('Poet', f2)), field('Poem', f3)]
     : [field('Prompt', f1), field('Answer', f2)];
@@ -1039,22 +1399,21 @@ function itemEditRow(d, r) {
     h('div', { class: 'row' },
       h('button', { type: 'button', class: 'btn primary', onclick: doSave }, 'Save'),
       h('button', { type: 'button', class: 'btn ghost', onclick: close }, 'Cancel'),
-      h('span', { class: 'spacer' }), delBtn)));
+      h('span', { class: 'spacer' }),
+      h('button', { type: 'button', class: 'linkbtn warn', onclick: () => { close(); deleteItemsWithUndo(d, [r.iid]); } }, poem ? 'Delete poem' : 'Delete fact'))));
 }
 
 // ---------------------------------------------------------------- add
 let lastParse = { rows: [], skipped: [] };
 function writableDecks(kind) {
-  return sortDecks([...S.decks.values()].filter(d => d.kind === kind && (
-    (d.scope === 'universal' && canEditUniversal()) || (d.scope === 'personal' && d.ownerId === myUid()))));
+  return sortDecks([...S.decks.values()].filter(d => d.kind === kind && (d.ownerId === myUid() || (category(d) === 'shared' && d.friendsCanEdit))));
 }
 function mountAdd() {
   mounted.add = true;
-  const root = $('view-add');
   const factsBox = h('div', { id: 'addFactsBox', class: 'stack-sm' },
     h('label', { class: 'label', for: 'pasteBox', text: 'Your facts' }),
     h('textarea', { id: 'pasteBox', class: 'data', spellcheck: 'false', placeholder: 'Capital of Australia | Canberra\nNumber of bones in the adult human body | 206\nChemistry | Chemical symbol for potassium | K' }),
-    h('p', { class: 'help' }, 'One fact per line, prompt first: ', h('code', { text: 'prompt | answer' }), '. To send lines to other decks of yours in the same paste, start the line with the deck name: ', h('code', { text: 'deck | prompt | answer' }), '. Tab-separated columns from a spreadsheet work too.'),
+    h('p', { class: 'help' }, 'One fact per line, prompt first: ', h('code', { text: 'prompt | answer' }), '. To send lines to other decks in the same paste, start the line with the deck name: ', h('code', { text: 'deck | prompt | answer' }), '. Tab-separated columns from a spreadsheet work too.'),
     h('div', { class: 'preview', id: 'preview', hidden: true }));
   const poemBox = h('div', { id: 'addPoemBox', class: 'stack-sm', hidden: true },
     h('div', { class: 'grid-2' },
@@ -1062,31 +1421,23 @@ function mountAdd() {
       field('Poet (optional)', h('input', { type: 'text', id: 'poemAuthor', maxlength: '200', autocomplete: 'off' }))),
     field('The poem', h('textarea', { id: 'poemText', class: 'poem-input', maxlength: String(MAX_POEM), placeholder: 'Paste or type the poem here. Line breaks and stanza gaps are kept.' })),
     h('p', { class: 'help', id: 'poemInfo' }));
-  const scopeRadio = (value, label) => {
-    const id = 'adScope-' + value;
-    const r = h('input', { type: 'radio', name: 'adScope', id, value });
-    r.addEventListener('change', updateAdd);
-    return h('label', { class: 'check', for: id, id: 'adScopeWrap-' + value }, r, h('span', { text: label }));
-  };
-  const share = h('input', { type: 'checkbox', id: 'adShare' });
   const newDeck = h('div', { id: 'addNewDeck', class: 'panel-box', hidden: true },
     field('New deck name', h('input', { type: 'text', id: 'newDeckName', maxlength: '80', autocomplete: 'off', placeholder: 'e.g. Biology terms' })),
-    h('div', { class: 'radios', id: 'adScopes' }, scopeRadio('universal', 'Universal: everyone studies it'), scopeRadio('personal', 'Just me')),
-    h('label', { class: 'check', for: 'adShare', id: 'adShareWrap' }, share, h('span', { text: 'Let friends see and study it' })));
-
-  put(root, 
+    h('div', { class: 'stack-sm' },
+      check('adShare', 'Share with friends', true, () => updateAdd()),
+      check('adEdit', 'Friends can edit it too', false)),
+    h('p', { class: 'help', text: 'You can change these, and the allowed mistakes, later on the deck\'s page.' }));
+  put($('view-add'),
     h('div', { class: 'row', style: 'align-items:flex-start' },
       h('div', { style: 'flex:1 1 18rem;min-width:0' }, h('h1', { text: 'Add' }), h('p', { class: 'lede', id: 'addLede' })),
       seg('addKind', [['facts', 'Facts'], ['poems', 'Poems']], S.add.kind, (k) => { S.add.kind = k; S.add.chosen = false; S.add.deckId = null; $('addStatus').textContent = ''; renderAdd(); })),
     h('div', { class: 'field' }, h('label', { class: 'label', for: 'addDeck', text: 'Add to' }), h('select', { id: 'addDeck' })),
     newDeck, factsBox, poemBox,
-    h('div', { class: 'row' }, h('button', { type: 'button', class: 'btn primary big', id: 'addBtn', disabled: true }, 'Add'), h('p', { class: 'status', id: 'addStatus', role: 'status' }))
-  );
+    h('div', { class: 'row' }, h('button', { type: 'button', class: 'btn primary big', id: 'addBtn', disabled: true }, 'Add'), h('p', { class: 'status', id: 'addStatus', role: 'status' })));
   $('addDeck').addEventListener('change', (e) => { S.add.deckId = e.target.value; S.add.chosen = true; renderAdd(); if (S.add.deckId === '__new') $('newDeckName').focus(); });
   let t = 0;
   const later = () => { clearTimeout(t); t = setTimeout(updateAdd, 120); $('addStatus').textContent = ''; };
   for (const id of ['pasteBox', 'newDeckName', 'poemTitle', 'poemAuthor', 'poemText']) $(id).addEventListener('input', later);
-  share.addEventListener('change', updateAdd);
   $('addBtn').addEventListener('click', () => (S.add.kind === 'poems' ? addPoem() : addFacts()));
 }
 function renderAdd() {
@@ -1097,33 +1448,26 @@ function renderAdd() {
   const decks = writableDecks(kind);
   let val = S.add.deckId;
   if (!S.add.chosen || (val !== '__new' && !decks.some(d => d.id === val))) {
-    const mine = decks.find(d => d.scope === 'personal');
+    const mine = decks.find(d => d.ownerId === myUid());
     val = (mine || decks[0] || { id: '__new' }).id;
   }
   S.add.deckId = val;
   const sel = $('addDeck');
-  const groups = [];
-  const uni = decks.filter(d => d.scope === 'universal');
-  const mine = decks.filter(d => d.scope === 'personal');
-  const opt = (d) => h('option', { value: d.id, text: `${d.name} (${itemsOf(d).length})` });
-  if (uni.length) groups.push(h('optgroup', { label: 'Universal' }, ...uni.map(opt)));
-  if (mine.length) groups.push(h('optgroup', { label: 'My decks' }, ...mine.map(opt)));
-  groups.push(h('option', { value: '__new', text: 'New deck…' }));
-  put(sel, ...groups);
+  const mine = decks.filter(d => d.ownerId === myUid());
+  const theirs = decks.filter(d => d.ownerId !== myUid());
+  put(sel,
+    mine.length ? h('optgroup', { label: 'My decks' }, ...mine.map(d => h('option', { value: d.id, text: `${d.name} (${itemsOf(d).length})` }))) : null,
+    theirs.length ? h('optgroup', { label: "Friends' decks you can edit" }, ...theirs.map(d => h('option', { value: d.id, text: `${d.name} · ${ownerLabel(d)} (${itemsOf(d).length})` }))) : null,
+    h('option', { value: '__new', text: 'New deck…' }));
   sel.value = val;
-  const isNew = val === '__new';
-  $('addNewDeck').hidden = !isNew;
-  $('adScopeWrap-universal').hidden = !canEditUniversal();
-  const checked = document.querySelector('input[name="adScope"]:checked');
-  if (!checked || (checked.value === 'universal' && !canEditUniversal())) $('adScope-personal').checked = true;
+  $('addNewDeck').hidden = val !== '__new';
   $('addFactsBox').hidden = kind !== 'facts';
   $('addPoemBox').hidden = kind !== 'poems';
   updateAdd();
 }
 function newDeckChoice() {
-  const sc = document.querySelector('input[name="adScope"]:checked');
-  const scope = sc && sc.value === 'universal' && canEditUniversal() ? 'universal' : 'personal';
-  return { name: $('newDeckName').value.trim(), scope, visibility: $('adShare').checked ? 'shared' : 'private' };
+  const shared = $('adShare').checked;
+  return { name: $('newDeckName').value.trim(), visibility: shared ? 'shared' : 'private', friendsCanEdit: shared && $('adEdit').checked };
 }
 function targetName() {
   if (S.add.deckId === '__new') return $('newDeckName').value.trim();
@@ -1150,9 +1494,7 @@ function parseFacts(text) {
     if (!deck) { skipped.push({ n: idx + 1, why: 'name the new deck above, or start the line with a deck' }); return; }
     if (p.length > MAX_FIELD || a.length > MAX_FIELD) { skipped.push({ n: idx + 1, why: 'longer than 2,000 characters' }); return; }
     deck = deck.slice(0, 80);
-    let existing = null;
-    if (!routed && S.add.deckId !== '__new') existing = S.decks.get(S.add.deckId) || null;
-    else existing = byName(deck);
+    const existing = (!routed && S.add.deckId !== '__new') ? (S.decks.get(S.add.deckId) || null) : byName(deck);
     const dk = existing ? 'id:' + existing.id : 'new:' + norm(deck);
     const pk = norm(p);
     if (existing && itemsOf(existing).some(([, it]) => norm(it.p) === pk)) { skipped.push({ n: idx + 1, why: `already in ${existing.name}` }); return; }
@@ -1166,13 +1508,12 @@ function parseFacts(text) {
 function updateAdd() {
   const kind = S.add.kind;
   const isNew = S.add.deckId === '__new';
-  $('adShareWrap').hidden = !isNew || newDeckChoice().scope !== 'personal';
+  $('adEdit').closest('label').hidden = !$('adShare').checked;
   const btn = $('addBtn');
   if (kind === 'poems') {
     const title = $('poemTitle').value.trim();
     const text = cleanPoem($('poemText').value);
-    const lines = poemLines(text);
-    $('poemInfo').textContent = text ? `${plural(lines, 'line')}${title ? '' : ' · add a title'}` : 'Tip: keep a blank line between stanzas.';
+    $('poemInfo').textContent = text ? `${plural(poemLines(text), 'line')}${title ? '' : ' · add a title'}` : 'Tip: keep a blank line between stanzas.';
     btn.disabled = !title || !text || (isNew && !$('newDeckName').value.trim());
     btn.textContent = 'Add poem';
     return;
@@ -1192,11 +1533,11 @@ function updateAdd() {
     r.skipped.length ? h('span', { class: 'pill skip', text: `${r.skipped.length} skipped` }) : null)];
   if (r.rows.length) {
     const showDeck = touched.size > 1;
-    const shown = r.rows.slice(0, 6);
+    const shownRows = r.rows.slice(0, 6);
     kids.push(h('div', { class: 'tablewrap' }, h('table', { class: 'pv' },
       h('thead', null, h('tr', null, showDeck ? h('th', { text: 'Deck' }) : null, h('th', { text: 'Prompt' }), h('th', { text: 'Answer' }))),
-      h('tbody', null, ...shown.map(row => h('tr', null, showDeck ? h('td', { text: row.deck }) : null, h('td', { text: row.p }), h('td', { text: row.a }))),
-        r.rows.length > shown.length ? h('tr', null, h('td', { colspan: showDeck ? '3' : '2', text: `…and ${(r.rows.length - shown.length).toLocaleString()} more` })) : null))));
+      h('tbody', null, ...shownRows.map(row => h('tr', null, showDeck ? h('td', { text: row.deck }) : null, h('td', { text: row.p }), h('td', { text: row.a }))),
+        r.rows.length > shownRows.length ? h('tr', null, h('td', { colspan: showDeck ? '3' : '2', text: `…and ${(r.rows.length - shownRows.length).toLocaleString()} more` })) : null))));
   }
   if (r.skipped.length) kids.push(h('ul', { class: 'skipped' }, ...r.skipped.slice(0, 8).map(s => h('li', { text: `Line ${s.n}: ${s.why}` })), r.skipped.length > 8 ? h('li', { text: `…and ${r.skipped.length - 8} more` }) : null));
   if (newOnes.some(x => x.routed)) kids.push(h('p', { class: 'help', text: 'Decks named at the start of a line that you don\'t have yet are created as private decks of your own.' }));
@@ -1225,14 +1566,14 @@ async function addFacts() {
     } else {
       if (bytes(items) > MAX_DECK_BYTES) { status.className = 'status err'; status.textContent = 'That is more than one deck holds. Split it across two decks.'; btn.disabled = false; return; }
       const fromBox = !g.r.routed;
-      plans.push({ kind: 'create', name: g.r.deck, scope: fromBox ? choice.scope : 'personal', visibility: fromBox ? choice.visibility : 'private', items, n: g.rows.length, fromBox });
+      plans.push({ kind: 'create', name: g.r.deck, visibility: fromBox ? choice.visibility : 'private', friendsCanEdit: fromBox && choice.friendsCanEdit, items, n: g.rows.length, fromBox });
     }
   }
   try {
     let createdFromBox = null;
     for (const p of plans) {
       if (p.kind === 'add') await addItems(p.id, p.items);
-      else { const id = await createDeck({ name: p.name, kind: 'facts', scope: p.scope, visibility: p.visibility, items: p.items }); if (p.fromBox) createdFromBox = id; }
+      else { const id = await createDeck({ name: p.name, kind: 'facts', visibility: p.visibility, friendsCanEdit: p.friendsCanEdit, items: p.items }); if (p.fromBox) createdFromBox = id; }
     }
     const total = plans.reduce((a, p) => a + p.n, 0);
     status.className = 'status ok';
@@ -1259,7 +1600,7 @@ async function addPoem() {
     if (S.add.deckId === '__new') {
       const ch = newDeckChoice();
       if (!ch.name) { status.className = 'status err'; status.textContent = 'Name the new deck.'; btn.disabled = false; return; }
-      const newId = await createDeck({ name: ch.name, kind: 'poems', scope: ch.scope, visibility: ch.visibility, items: { [id]: item } });
+      const newId = await createDeck({ name: ch.name, kind: 'poems', visibility: ch.visibility, friendsCanEdit: ch.friendsCanEdit, items: { [id]: item } });
       S.add.deckId = newId; S.add.chosen = true; deckName = ch.name; $('newDeckName').value = '';
     } else {
       const d = S.decks.get(S.add.deckId);
@@ -1288,7 +1629,6 @@ function mountPeople() {
   mounted.people = true;
   const name = h('input', { type: 'text', id: 'npName', maxlength: '60', autocomplete: 'off' });
   const email = h('input', { type: 'email', id: 'npEmail', autocomplete: 'off' });
-  const uni = h('input', { type: 'checkbox', id: 'npUni' });
   const pwMode = (value, label, checked) => {
     const id = 'npPw-' + value;
     const r = h('input', { type: 'radio', name: 'npPw', id, value, checked });
@@ -1312,13 +1652,13 @@ function mountPeople() {
       const cred = await createUserWithEmailAndPassword(sAuth, e, mode === 'temp' ? temp.value : randomPassword());
       const uid = cred.user.uid;
       await signOut(sAuth);
-      await setDoc(doc(db, 'users', uid), { name: n, email: e, active: true, canEditUniversal: uni.checked, createdAt: serverTimestamp() });
+      await setDoc(doc(db, 'users', uid), { name: n, email: e, active: true, createdAt: serverTimestamp() });
       if (mode === 'link') await sendPasswordResetEmail(auth, e);
       status.className = 'status ok';
       status.textContent = mode === 'link'
         ? `Account made. ${n} will get an email with a link to set their password (it may land in spam).`
         : `Account made. Give ${n} their email and the temporary password; they can change it from their account page.`;
-      name.value = ''; email.value = ''; temp.value = ''; uni.checked = false;
+      name.value = ''; email.value = ''; temp.value = '';
     } catch (err) {
       console.error(err);
       const c = (err && err.code) || '';
@@ -1329,39 +1669,35 @@ function mountPeople() {
     }
     btn.disabled = false;
   };
-  put($('view-people'), 
-    h('div', null, h('h1', { text: 'People' }), h('p', { class: 'lede', text: 'Make accounts for your friends and choose what they can do. Everyone can make their own decks; only people you allow can add to or change universal decks.' })),
+  put($('view-people'),
+    h('div', null, h('h1', { text: 'People' }), h('p', { class: 'lede', text: 'Make accounts for your friends. Everyone can make their own decks and choose who sees and edits them.' })),
     h('form', { class: 'panel-box', novalidate: true, onsubmit: (ev) => { ev.preventDefault(); create(); } },
       h('h2', { text: 'Add a person' }),
       h('div', { class: 'grid-2' }, field('Name', name), field('Email', email)),
-      h('label', { class: 'check', for: 'npUni' }, uni, h('span', { text: 'Can add to and edit universal decks' })),
       h('div', { class: 'field' }, h('span', { class: 'label', text: 'Password' }),
         h('div', { class: 'radios' }, pwMode('link', 'Email them a link to set their own', true), pwMode('temp', 'I\'ll set a temporary one', false))),
       h('div', { id: 'npTempWrap', hidden: true }, field('Temporary password', temp)),
       h('div', { class: 'row' }, btn), status),
     h('div', { id: 'requestsBox' }),
-    h('div', { class: 'deck-section' }, h('h3', { text: 'Accounts' }), h('ul', { class: 'people', id: 'peopleList' }))
-  );
+    h('div', { class: 'deck-section' }, h('h3', { text: 'Accounts' }), h('ul', { class: 'people', id: 'peopleList' })));
 }
 function renderPeople() {
   if (!S.isAdmin) return;
   if (!mounted.people) mountPeople();
-  // requests
   const reqs = [...S.requests.entries()];
-  put($('requestsBox'), ...(reqs.length ? [h('div', { class: 'deck-section' }, h('h3', { text: 'Waiting for you to approve' }),
+  put($('requestsBox'), reqs.length ? h('div', { class: 'deck-section' }, h('h3', { text: 'Waiting for you to approve' }),
     h('ul', { class: 'people' }, ...reqs.map(([uid, r]) => h('li', { class: 'person' },
       h('div', { style: 'min-width:0' }, h('div', { class: 'pn', text: String(r.name || 'Someone') }), h('div', { class: 'pe', text: String(r.email || '') })),
       h('div', { class: 'row' },
         h('button', { type: 'button', class: 'btn primary', onclick: async () => {
-          const ok = await save(setDoc(doc(db, 'users', uid), { name: String(r.name || 'Friend').slice(0, 60), email: String(r.email || ''), active: true, canEditUniversal: false, createdAt: serverTimestamp() }), `${r.name || 'They'} can now sign in and study.`);
+          const ok = await save(setDoc(doc(db, 'users', uid), { name: String(r.name || 'Friend').slice(0, 60), email: String(r.email || ''), active: true, createdAt: serverTimestamp() }), `${r.name || 'They'} can now sign in and study.`);
           if (ok) save(deleteDoc(doc(db, 'requests', uid)));
         } }, 'Approve'),
-        h('button', { type: 'button', class: 'btn ghost', onclick: () => save(deleteDoc(doc(db, 'requests', uid)), 'Request dismissed.') }, 'Dismiss'))))))] : []));
-
+        h('button', { type: 'button', class: 'btn ghost', onclick: () => save(deleteDoc(doc(db, 'requests', uid)), 'Request dismissed.') }, 'Dismiss')))))) : null);
   if (S.pp.renaming) return;   // keep the rename box
   const list = $('peopleList');
   const deckCounts = new Map();
-  for (const d of S.decks.values()) if (d.scope === 'personal') {
+  for (const d of S.decks.values()) {
     const c = deckCounts.get(d.ownerId) || { all: 0, shared: 0 };
     c.all++; if (d.visibility === 'shared') c.shared++;
     deckCounts.set(d.ownerId, c);
@@ -1375,7 +1711,7 @@ function renderPeople() {
 function personRow(uid, p, counts) {
   const isAdminRow = uid === S.adminUid;
   const c = counts || { all: 0, shared: 0 };
-  const deckLine = `${plural(c.all, 'deck')} of their own${c.shared ? `, ${c.shared} shared` : ''}`;
+  const deckLine = `${plural(c.all, 'deck')}${c.shared ? `, ${c.shared} shared` : ''}`;
   if (S.pp.renaming === uid) {
     const inp = h('input', { type: 'text', id: 'ppRename', maxlength: '60', value: String(p.name || ''), 'aria-label': 'Name' });
     const done = () => { S.pp.renaming = null; renderPeople(); };
@@ -1392,17 +1728,11 @@ function personRow(uid, p, counts) {
       h('button', { type: 'button', class: 'btn primary', onclick: go2 }, 'Save'),
       h('button', { type: 'button', class: 'btn ghost', onclick: done }, 'Cancel')));
   }
-  const toggle = (id, label, checked, onChange) => {
-    const cb = h('input', { type: 'checkbox', id, checked, 'data-key': id });
-    cb.addEventListener('change', () => onChange(cb.checked));
-    return h('label', { class: 'check', for: id }, cb, h('span', { text: label }));
-  };
   return h('li', { class: 'person' },
     h('div', { style: 'min-width:0' },
       h('div', { class: 'pn' }, h('span', { text: String(p.name || 'Unnamed') }),
         isAdminRow ? h('span', { class: 'pill admin', text: 'Admin' }) : null,
-        !isAdminRow && p.active !== true ? h('span', { class: 'pill off', text: 'Turned off' }) : null,
-        !isAdminRow && p.canEditUniversal ? h('span', { class: 'pill uni', text: 'Edits universal' }) : null),
+        !isAdminRow && p.active !== true ? h('span', { class: 'pill off', text: 'Turned off' }) : null),
       h('div', { class: 'pe', text: String(p.email || '') }),
       h('div', { class: 'pd', text: deckLine })),
     h('div', { class: 'row', style: 'justify-content:flex-end' },
@@ -1411,9 +1741,7 @@ function personRow(uid, p, counts) {
         try { await sendPasswordResetEmail(auth, p.email); toast(`Sent a password reset link to ${p.email}.`); } catch (e) { toast(authError(e)); }
       } }, 'Send password reset') : null),
     !isAdminRow ? h('div', { class: 'pc' },
-      toggle('uni-' + uid, 'Can add to and edit universal decks', p.canEditUniversal === true,
-        (v) => save(updateDoc(doc(db, 'users', uid), { canEditUniversal: v }), v ? `${p.name} can now edit universal decks.` : `${p.name} can no longer edit universal decks.`)),
-      toggle('act-' + uid, 'Account on', p.active === true,
+      check('act-' + uid, 'Account on', p.active === true,
         (v) => save(updateDoc(doc(db, 'users', uid), { active: v }), v ? `${p.name} can sign in again.` : `${p.name}'s account is turned off. Their decks are kept.`))) : null);
 }
 
@@ -1430,8 +1758,8 @@ function renderAccount() {
     if (ok && S.isAdmin) await save(updateDoc(doc(db, 'meta', 'admin'), { name: v.slice(0, 60) }));
     if (ok) { status.className = 'status ok'; status.textContent = 'Saved. New decks will show this name.'; }
   };
-  put($('view-account'), 
-    h('div', null, h('h1', { text: 'Your account' }), h('p', { class: 'lede', text: S.fbUser.email || '' })),
+  put($('view-account'),
+    h('div', null, h('h1', { text: 'Your account' }), h('p', { class: 'lede', text: (S.fbUser.email || '') + (S.isAdmin ? ' · admin' : '') })),
     h('form', { class: 'panel-box', novalidate: true, onsubmit: (e) => { e.preventDefault(); saveName(); } },
       field('Your name', name), h('div', { class: 'row' }, h('button', { type: 'submit', class: 'btn primary' }, 'Save name')), status),
     h('div', { class: 'panel-box' },
@@ -1440,27 +1768,45 @@ function renderAccount() {
       h('div', { class: 'row' }, h('button', { type: 'button', class: 'btn ghost', onclick: async () => {
         try { await sendPasswordResetEmail(auth, S.fbUser.email); toast('Check your email for a link to set a new password.'); } catch (e) { toast(authError(e)); }
       } }, 'Email me a reset link'))),
-    h('div', null, h('button', { type: 'button', class: 'btn ghost', onclick: () => signOut(auth) }, 'Sign out'))
-  );
+    h('div', null, h('button', { type: 'button', class: 'btn ghost', onclick: () => signOut(auth) }, 'Sign out')));
 }
 
 // ---------------------------------------------------------------- events
 for (const b of document.querySelectorAll('.tab')) b.addEventListener('click', () => go(b.dataset.view));
 $('whoBtn').addEventListener('click', () => go('account'));
-$('revealBtn').addEventListener('click', reveal);
-$('nextBtn').addEventListener('click', recordAndNext);
-$('skipBtn').addEventListener('click', skip);
 $('endBtn').addEventListener('click', endSet);
-$('firstLineBtn').addEventListener('click', () => { if (S.session) { S.session.firstLine = true; renderCard(); $('revealBtn').focus({ preventScroll: true }); } });
+$('undoBtn').addEventListener('click', undo);
+$('typeInput').addEventListener('input', (e) => { if (S.session) S.session.typed = e.target.value; });
+$('typeInput').addEventListener('keydown', (e) => {
+  const s = S.session; if (!s || s.phase !== 'ask') return;
+  const poem = s.kind === 'poems';
+  if (e.key === 'Enter' && (poem ? (e.metaKey || e.ctrlKey) : !e.shiftKey)) { e.preventDefault(); revealOrCheck(); }
+});
 document.addEventListener('keydown', (e) => {
-  if (S.phase !== 'app' || S.view !== 'study' || !S.session || S.session.finished) return;
+  const s = S.session;
+  if (S.phase !== 'app' || S.view !== 'study' || !s) return;
   const tag = (e.target && e.target.tagName) || '';
   if (/INPUT|TEXTAREA|SELECT/.test(tag) || e.metaKey || e.ctrlKey || e.altKey) return;
-  const onOther = tag === 'BUTTON' && e.target.id !== 'revealBtn' && e.target.id !== 'nextBtn';
-  if (onOther && (e.key === ' ' || e.key === 'Enter')) return;
-  if (e.key === ' ' || e.key === 'Spacebar') { e.preventDefault(); if (!S.session.revealed) reveal(); }
-  else if (e.key === 'Enter') { e.preventDefault(); S.session.revealed ? recordAndNext() : reveal(); }
-  else if (e.key === 's' || e.key === 'S') { e.preventDefault(); skip(); }
+  const k = e.key;
+  if ((k === 'u' || k === 'U') && s.undo.length) { e.preventDefault(); undo(); return; }
+  if (s.finished) return;
+  const onOther = tag === 'BUTTON' && !e.target.hasAttribute('data-primary');
+  const poem = s.kind === 'poems';
+  if (s.phase === 'ask') {
+    if (onOther && (k === ' ' || k === 'Enter')) return;
+    if (k === ' ' || k === 'Enter') { e.preventDefault(); revealOrCheck(); }
+    else if (k === 's' || k === 'S') { e.preventDefault(); skip(); }
+    else if ((k === 'h' || k === 'H') && poem && s.hint < 2) { e.preventDefault(); s.hint++; renderCard(); }
+    return;
+  }
+  if (s.mode === 'paper' && !poem) {
+    if (k === 'ArrowLeft' || k === '1' || k === 'm' || k === 'M') { e.preventDefault(); commit(false); }
+    else if (k === 'ArrowRight' || k === '2' || k === 'g' || k === 'G') { e.preventDefault(); commit(true); }
+    else if (k === 'Enter' && !onOther) { e.preventDefault(); commit(true); }
+  } else if (k === 'Enter' && !onOther) {
+    e.preventDefault();
+    const cur = currentItem(); if (cur) commit(outcome(s, cur.d, cur.it).right);
+  }
 });
 
 boot();
