@@ -36,6 +36,9 @@ const S = {
   isAdmin: false, listenersFor: null, settingUp: false, authShown: null,
   decks: new Map(), deckParts: {}, decksLoaded: false, pendingDecks: new Map(),
   progress: {}, days: {}, people: new Map(), peopleLoaded: false, requests: new Map(),
+  profiles: new Map(), profilesLoaded: false, stats: new Map(), friendsLoaded: false, friendsListening: false,
+  myStats: null, myStatsLoaded: false, progressLoaded: false, friendsSort: 'week',
+  theme: { id: 'classic' }, themeSaved: null, themePreview: false,
   view: 'study',
   study: freshStudy(),
   session: null,
@@ -169,6 +172,147 @@ function allowSelect(id, value, onChange, withDeckOption) {
   return sel;
 }
 
+// ---------------------------------------------------------------- themes
+// Each theme takes its main color from an iPhone finish and pairs it with complementary accents.
+// Only a few colors are picked by hand; the rest are derived and checked for readable contrast.
+const CLASSIC_PREVIEW = { mode: 'light', bg: '#EDF1F6', card: '#FFFFFF', accent: '#2944C4', pen: '#2340B8', margin: '#D8524A', hl: '#FFE45E' };
+const THEME_GROUPS = [
+  ['iPhone 18 Pro', [
+    ['burgundy', 'Burgundy', '#5E1A28', { mode: 'dark', bg: '#1A0E12', accent: '#E8798F', pen: '#F4B9C6', margin: '#E3B65C', hl: '#E3B65C' }],
+    ['glacier', 'Glacier', '#C9DCE6', { mode: 'light', bg: '#E9F1F5', accent: '#2C6E8F', pen: '#1D5B7A', margin: '#D8634D', hl: '#FFE3A6' }],
+    ['silver', 'Silver', '#E2E3E4', { mode: 'light', bg: '#EDEEF0', accent: '#3A4A63', pen: '#2D4C82', margin: '#D4544A', hl: '#FFE45E' }, 'Also on iPhone 17 Pro'],
+    ['black', 'Black', '#232426', { mode: 'dark', bg: '#101113', accent: '#9FB4FF', pen: '#C7D4FF', margin: '#FF7A6B', hl: '#E9CF4E' }, 'Also on iPhone 17 and 16'],
+  ]],
+  ['iPhone 17 Pro', [
+    ['cosmic-orange', 'Cosmic Orange', '#F77E2D', { mode: 'light', bg: '#FFF1E6', accent: '#C4520E', pen: '#2350B5', margin: '#2F5BD3', hl: '#FFD3A8' }],
+    ['deep-blue', 'Deep Blue', '#32374A', { mode: 'dark', bg: '#11162A', accent: '#F29A4A', pen: '#AFC4FF', margin: '#F29A4A', hl: '#F2C14A' }],
+  ]],
+  ['iPhone Air', [
+    ['sky-blue', 'Sky Blue', '#DCEAF4', { mode: 'light', bg: '#EDF5FB', accent: '#2C74B0', pen: '#1C5A92', margin: '#E46A58', hl: '#FFF0A0' }],
+    ['light-gold', 'Light Gold', '#EFE2C6', { mode: 'light', bg: '#FAF4E4', accent: '#8E6210', pen: '#33489C', margin: '#C0533B', hl: '#F4D684' }],
+    ['cloud-white', 'Cloud White', '#F2F2EE', { mode: 'light', bg: '#F5F5F2', accent: '#3E63DD', pen: '#2B49B8', margin: '#E05A4F', hl: '#FFE58A' }],
+    ['space-black', 'Space Black', '#2B2C30', { mode: 'dark', bg: '#0D0E11', accent: '#7DD3FC', pen: '#C2DCFF', margin: '#FF6B6B', hl: '#F5D565' }],
+  ]],
+  ['iPhone 17', [
+    ['lavender', 'Lavender', '#DCCBEB', { mode: 'light', bg: '#F4EFFA', accent: '#7046A8', pen: '#55348F', margin: '#C9577F', hl: '#E4F2A2' }],
+    ['mist-blue', 'Mist Blue', '#9DB4D6', { mode: 'light', bg: '#ECF1F8', accent: '#3A5C97', pen: '#284B88', margin: '#DB6E52', hl: '#FFE1A0' }],
+    ['sage', 'Sage', '#A9B78C', { mode: 'light', bg: '#F0F3E8', accent: '#4A6A2A', pen: '#2C4F33', margin: '#B4546C', hl: '#F5E49C' }],
+    ['white', 'White', '#F6F6F6', { mode: 'light', bg: '#FAFAFA', card: '#FFFFFF', accent: '#2563EB', pen: '#1D4ED8', margin: '#E5413B', hl: '#FDE68A' }, 'Also on iPhone 16'],
+  ]],
+  ['iPhone 16 Pro', [
+    ['desert-titanium', 'Desert Titanium', '#BFA38C', { mode: 'light', bg: '#F5EEE6', accent: '#87553A', pen: '#2D4A6E', margin: '#B44E36', hl: '#F2D6A2' }],
+    ['natural-titanium', 'Natural Titanium', '#BDB7AD', { mode: 'light', bg: '#EFEDE8', accent: '#4D5C6B', pen: '#2F4760', margin: '#BF4F2E', hl: '#F0DE9A' }],
+    ['white-titanium', 'White Titanium', '#EEEDE8', { mode: 'light', bg: '#F4F3EF', accent: '#7A6544', pen: '#2B4762', margin: '#C2553E', hl: '#F3E1A6' }],
+    ['black-titanium', 'Black Titanium', '#3A3A3B', { mode: 'dark', bg: '#131313', accent: '#CDBA9C', pen: '#D6E1EC', margin: '#E07A5F', hl: '#CDBA9C' }],
+  ]],
+  ['iPhone 16', [
+    ['ultramarine', 'Ultramarine', '#8F9FF2', { mode: 'light', bg: '#EEF0FD', accent: '#4352D6', pen: '#2F3DB8', margin: '#D9701F', hl: '#FFD8A6' }],
+    ['teal', 'Teal', '#A6D3CF', { mode: 'light', bg: '#E9F5F3', accent: '#1C7670', pen: '#145954', margin: '#D2664A', hl: '#FFD9C7' }],
+    ['pink', 'Pink', '#F2B3D6', { mode: 'light', bg: '#FDF0F6', accent: '#B83C78', pen: '#7A2C5B', margin: '#2F8A5B', hl: '#CDEFD8' }],
+  ]],
+];
+const PRESETS = new Map();
+for (const [, list] of THEME_GROUPS) for (const [id, name, finish, spec] of list) PRESETS.set(id, { name, finish, spec });
+const THEME_KEYS = ['--paper', '--card', '--ink', '--ink-soft', '--line', '--rule', '--margin', '--accent', '--accent-soft', '--accent-ink',
+  '--pen', '--hl', '--hl-ink', '--ok', '--ok-soft', '--danger', '--danger-soft', '--shadow', 'color-scheme'];
+
+function hexRgb(hex) {
+  let x = String(hex || '').replace('#', '');
+  if (x.length === 3) x = x.split('').map(c => c + c).join('');
+  const n = parseInt(x, 16);
+  return Number.isFinite(n) ? [(n >> 16) & 255, (n >> 8) & 255, n & 255] : [0, 0, 0];
+}
+const rgbHex = (rgb) => '#' + rgb.map(v => Math.round(Math.max(0, Math.min(255, v))).toString(16).padStart(2, '0')).join('').toUpperCase();
+const mix = (a, b, t) => { const A = hexRgb(a), B = hexRgb(b); return rgbHex(A.map((v, i) => v + (B[i] - v) * t)); };
+function lum(hex) {
+  const c = hexRgb(hex).map(v => { v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); });
+  return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+}
+const contrastRatio = (a, b) => { const x = lum(a), y = lum(b); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); };
+// Nudge a color toward black (light themes) or white (dark themes) until it reads clearly on every background given.
+function ensureContrast(fg, bgs, ratio, dark) {
+  let c = fg;
+  for (let i = 0; i < 30 && bgs.some(b => contrastRatio(c, b) < ratio); i++) c = mix(c, dark ? '#FFFFFF' : '#000000', 0.07);
+  return c;
+}
+function hexHsl(hex) {
+  const [r, g, b] = hexRgb(hex).map(v => v / 255);
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), l = (max + min) / 2;
+  if (max === min) return [0, 0, l * 100];
+  const d = max - min, s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+  let hh = max === r ? (g - b) / d + (g < b ? 6 : 0) : max === g ? (b - r) / d + 2 : (r - g) / d + 4;
+  return [hh * 60, s * 100, l * 100];
+}
+function hslHex(hh, s, l) {
+  hh = ((hh % 360) + 360) % 360; s /= 100; l /= 100;
+  const k = (n) => (n + hh / 30) % 12, a = s * Math.min(l, 1 - l);
+  const f = (n) => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+  return rgbHex([f(0) * 255, f(8) * 255, f(4) * 255]);
+}
+const isDarkColor = (hex) => lum(hex) < 0.2;
+function deriveTheme(spec) {
+  const dark = spec.mode ? spec.mode === 'dark' : isDarkColor(spec.bg);
+  const bg = spec.bg;
+  const card = spec.card || (dark ? mix(bg, '#FFFFFF', 0.07) : mix(bg, '#FFFFFF', 0.72));
+  const surf = [bg, card];
+  const ink = ensureContrast(dark ? mix('#F1F3F7', spec.accent, 0.08) : mix('#15171D', spec.accent, 0.1), surf, 12, dark);
+  const inkSoft = ensureContrast(mix(ink, bg, 0.42), surf, 4.6, dark);
+  const accentSoft = mix(bg, spec.accent, dark ? 0.2 : 0.13);
+  const accent = ensureContrast(spec.accent, [bg, card, accentSoft], 4.5, dark);
+  const accentInk = contrastRatio(accent, '#FFFFFF') >= contrastRatio(accent, '#111111') ? '#FFFFFF' : '#111111';
+  const pen = ensureContrast(spec.pen || accent, [card], 4.6, dark);
+  const margin = ensureContrast(spec.margin || (dark ? '#E2716A' : '#D8524A'), [card], 4.2, dark);
+  const hl = spec.hl || (dark ? '#E9CF4E' : '#FFE45E');
+  const hlInk = contrastRatio(hl, '#111111') >= contrastRatio(hl, '#FFFFFF') ? '#1E1A0A' : '#FFFFFF';
+  const okBase = dark ? '#6FD3A0' : '#1F7A4D', dangerBase = dark ? '#F08A80' : '#B23A30';
+  const okSoft = mix(bg, okBase, dark ? 0.18 : 0.14), dangerSoft = mix(bg, dangerBase, dark ? 0.18 : 0.12);
+  return {
+    '--paper': bg, '--card': card, '--ink': ink, '--ink-soft': inkSoft,
+    '--line': mix(bg, ink, dark ? 0.16 : 0.13), '--rule': mix(card, spec.accent, dark ? 0.2 : 0.16),
+    '--margin': margin, '--accent': accent, '--accent-soft': accentSoft, '--accent-ink': accentInk,
+    '--pen': pen, '--hl': hl, '--hl-ink': hlInk,
+    '--ok': ensureContrast(okBase, [card, okSoft], 4.5, dark), '--ok-soft': okSoft,
+    '--danger': ensureContrast(dangerBase, [card, dangerSoft], 4.5, dark), '--danger-soft': dangerSoft,
+    '--shadow': dark ? '0 1px 0 rgba(0,0,0,.3), 0 12px 30px -14px rgba(0,0,0,.75)' : '0 1px 0 rgba(22,32,58,.05), 0 10px 26px -14px rgba(22,32,58,.32)',
+    'color-scheme': dark ? 'dark' : 'light',
+  };
+}
+// Picks an accent, answer ink and margin color that go with a background.
+function suggestColors(bg) {
+  const dark = isDarkColor(bg);
+  const [hh, s] = hexHsl(bg);
+  const neutral = s < 12;
+  const base = neutral ? 225 : hh + 180;
+  return {
+    bg,
+    accent: hslHex(base, neutral ? 70 : 62, dark ? 70 : 38),
+    pen: hslHex(base + 18, 58, dark ? 80 : 30),
+    margin: hslHex(neutral ? 6 : hh + 40, 68, dark ? 66 : 48),
+  };
+}
+function themeSpec(theme) {
+  if (!theme || !theme.id || theme.id === 'classic') return null;
+  if (theme.id === 'custom') return theme.custom && theme.custom.bg && theme.custom.accent ? theme.custom : null;
+  const p = PRESETS.get(theme.id);
+  return p ? p.spec : null;
+}
+function applyTheme(theme) {
+  const root = document.documentElement;
+  for (const k of THEME_KEYS) root.style.removeProperty(k);
+  const spec = themeSpec(theme);
+  if (spec) for (const [k, v] of Object.entries(deriveTheme(spec))) root.style.setProperty(k, v);
+  const paper = getComputedStyle(document.body || root).backgroundColor;
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta && paper) meta.setAttribute('content', paper);
+  S.theme = spec ? theme : { id: 'classic' };
+}
+function cacheTheme(theme) { try { localStorage.setItem('rbh.theme', JSON.stringify(theme)); } catch (e) { /* ignore */ } }
+async function saveTheme(theme) {
+  S.themeSaved = theme; S.themePreview = false;
+  applyTheme(theme); cacheTheme(theme);
+  if (myUid()) await save(updateDoc(doc(db, 'users', myUid()), { theme }), 'Theme saved.');
+}
+
 // ---------------------------------------------------------------- answer checking
 function normText(s) {
   return String(s || '').normalize('NFKD').replace(/[̀-ͯ]/g, '').toLowerCase()
@@ -183,27 +327,35 @@ function tokens(text) {
   }
   return out;
 }
-// Word-level edit distance with a record of which words lined up.
+// 2 = same word, 1 = small typo, 0 = different word
+function wordScore(a, b) {
+  if (a === b) return 2;
+  const L = Math.max(a.length, b.length);
+  if (L < 4 || Math.abs(a.length - b.length) > 2) return 0;
+  return charDist(a, b) <= Math.max(1, Math.floor(L / 5)) ? 1 : 0;
+}
+// Pairs up as many of your words with the answer's words as possible, in reading order (earliest pairing wins ties).
 function alignWords(a, b) {
   const n = a.length, m = b.length;
-  if ((n + 1) * (m + 1) > 9e6) return null;
+  if ((n + 1) * (m + 1) > 4e6) return null;
   const W = m + 1;
-  const d = new Uint16Array((n + 1) * W);
-  for (let i = 0; i <= n; i++) d[i * W] = i;
-  for (let j = 0; j <= m; j++) d[j] = j;
-  for (let i = 1; i <= n; i++) for (let j = 1; j <= m; j++) {
-    const c = a[i - 1] === b[j - 1] ? 0 : 1;
-    d[i * W + j] = Math.min(d[(i - 1) * W + j] + 1, d[i * W + j - 1] + 1, d[(i - 1) * W + j - 1] + c);
+  const s = new Uint16Array((n + 1) * W);
+  for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) {
+    const down = s[(i + 1) * W + j], right = s[i * W + j + 1];
+    let best = down > right ? down : right;
+    const w = wordScore(a[i], b[j]);
+    if (w) { const diag = s[(i + 1) * W + j + 1] + w; if (diag > best) best = diag; }
+    s[i * W + j] = best;
   }
-  const aOk = new Array(n).fill(false), bOk = new Array(m).fill(false);
-  let i = n, j = m;
-  while (i > 0 || j > 0) {
-    if (i > 0 && j > 0 && a[i - 1] === b[j - 1] && d[i * W + j] === d[(i - 1) * W + j - 1]) { aOk[i - 1] = true; bOk[j - 1] = true; i--; j--; }
-    else if (i > 0 && j > 0 && d[i * W + j] === d[(i - 1) * W + j - 1] + 1) { i--; j--; }
-    else if (i > 0 && d[i * W + j] === d[(i - 1) * W + j] + 1) { i--; }
-    else { j--; }
+  const aSt = new Array(n).fill('miss'), bSt = new Array(m).fill('extra');
+  let i = 0, j = 0;
+  while (i < n && j < m) {
+    const w = wordScore(a[i], b[j]);
+    if (w && s[i * W + j] === s[(i + 1) * W + j + 1] + w) { aSt[i] = bSt[j] = w === 2 ? 'ok' : 'typo'; i++; j++; }
+    else if (s[(i + 1) * W + j] >= s[i * W + j + 1]) i++;
+    else j++;
   }
-  return { dist: d[n * W + m], aOk, bOk };
+  return { aSt, bSt };
 }
 function charDist(a, b) {
   if (a === b) return 0;
@@ -215,28 +367,42 @@ function charDist(a, b) {
   }
   return prev[b.length];
 }
-// How far off a typed answer is (0–100), plus tokens marked for display.
-function grade(expected, typed, poem) {
+// How far off a typed answer is (0–100), which words to mark, and the missing phrases.
+// Short fact answers (1–2 words) are compared letter by letter; everything else word by word.
+function grade(expected, typed, kind) {
   const et = tokens(expected), tt = tokens(typed);
   const ew = et.filter(t => t.word), tw = tt.filter(t => t.word);
   let r = alignWords(ew.map(t => t.norm), tw.map(t => t.norm));
-  if (!r) {
-    const aOk = ew.map((t, k) => !!tw[k] && tw[k].norm === t.norm);
-    const bOk = tw.map((t, k) => !!ew[k] && ew[k].norm === t.norm);
-    r = { dist: aOk.filter(x => !x).length + Math.max(0, tw.length - ew.length), aOk, bOk };
-  }
-  ew.forEach((t, k) => { t.ok = r.aOk[k]; });
-  tw.forEach((t, k) => { t.ok = r.bOk[k]; });
+  if (!r) r = {
+    aSt: ew.map((t, k) => (tw[k] && tw[k].norm === t.norm ? 'ok' : 'miss')),
+    bSt: tw.map((t, k) => (ew[k] && ew[k].norm === t.norm ? 'ok' : 'extra')),
+  };
+  ew.forEach((t, k) => { t.st = r.aSt[k]; });
+  tw.forEach((t, k) => { t.st = r.bSt[k]; });
+  const missing = r.aSt.filter(x => x === 'miss').length;
+  const extra = r.bSt.filter(x => x === 'extra').length;
+  const typos = r.aSt.filter(x => x === 'typo').length;
   let off;
-  if (poem) off = (r.dist / Math.max(1, ew.length)) * 100;
-  else {
+  if (kind === 'facts' && ew.length <= 2) {
     const a = normText(expected), b = normText(typed);
     off = (charDist(a, b) / Math.max(1, a.length)) * 100;
+  } else off = ((Math.max(missing, extra) + typos * 0.5) / Math.max(1, ew.length)) * 100;
+  const gaps = []; let cur = [];
+  for (const t of et) {
+    if (t.space || !t.word) continue;
+    if (t.st === 'miss') cur.push(t.raw);
+    else if (cur.length) { gaps.push(cur.join(' ')); cur = []; }
   }
-  return { off: Math.min(100, off), et, tt };
+  if (cur.length) gaps.push(cur.join(' '));
+  const clean = (g) => g.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
+  return { off: Math.min(100, off), et, tt, gaps: gaps.map(clean).filter(Boolean) };
 }
-function renderTokens(list, badClass) {
-  return list.map(t => (t.space ? document.createTextNode(t.raw) : h('span', { class: t.word && !t.ok ? badClass : null, text: t.raw })));
+function renderTokens(list, side) {
+  return list.map(t => {
+    if (t.space) return document.createTextNode(t.raw);
+    const cls = !t.word ? null : t.st === 'typo' ? 'w-typo' : (side === 'exp' ? (t.st === 'miss' ? 'w-miss' : null) : (t.st === 'extra' ? 'w-extra' : null));
+    return h('span', { class: cls, text: t.raw });
+  });
 }
 
 // ---------------------------------------------------------------- prefs (per person, per device)
@@ -287,8 +453,9 @@ const canManage = (d) => S.isAdmin || d.ownerId === myUid();
 const canEditItems = (d) => canManage(d) || (d.visibility === 'shared' && d.friendsCanEdit);
 function ownerLabel(d) {
   if (d.ownerId === myUid()) return 'you';
+  const pr = S.profiles.get(d.ownerId);
   const p = S.people.get(d.ownerId);
-  return (p && p.name) || d.ownerName || 'someone';
+  return (pr && pr.name) || (p && p.name) || d.ownerName || 'someone';
 }
 function sortDecks(list) { return list.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })); }
 function studyDecks(kind) { return sortDecks([...S.decks.values()].filter(d => d.kind === kind && category(d) !== 'other')); }
@@ -347,12 +514,13 @@ function shuffle(a) {
   return a;
 }
 function streakInfo() {
-  const days = S.days || {};
+  const days = (S.myStats && S.myStats.days) || S.days || {};
   const d = new Date(); d.setHours(12, 0, 0, 0);
-  const today = Number(days[dayKey(d)]) || 0;
+  const today = typeof days[dayKey(d)] === 'number' ? days[dayKey(d)] : Number(days[dayKey(d)] && days[dayKey(d)].n) || 0;
   if (!today) d.setDate(d.getDate() - 1);
   let count = 0;
-  while (Number(days[dayKey(d)]) > 0) { count++; d.setDate(d.getDate() - 1); }
+  const cnt = (v) => (typeof v === 'number' ? v : Number(v && v.n) || 0);
+  while (cnt(days[dayKey(d)]) > 0) { count++; d.setDate(d.getDate() - 1); }
   return { count, today };
 }
 
@@ -455,6 +623,8 @@ function startUser(uid) {
     if (!s.exists() && s.metadata.fromCache) return;
     S.me = s.exists() ? s.data() : null;
     S.meLoaded = true;
+    const th = S.me && S.me.theme;
+    if (th && th.id && stableStr(th) !== stableStr(S.themeSaved || {}) && !S.themePreview) { S.themeSaved = th; applyTheme(th); cacheTheme(th); }
     route();
   }, (e) => { console.error(e); S.me = null; S.meLoaded = true; route(); }));
   userUnsubs.push(onSnapshot(doc(db, 'requests', uid), (s) => {
@@ -494,7 +664,17 @@ function startData() {
     const d = s.exists() ? s.data() : {};
     S.progress = d.p || {};
     S.days = d.days || {};
+    S.progressLoaded = true;
     refresh();
+  }, onErr));
+  dataUnsubs.push(onSnapshot(doc(db, 'stats', uid), (s) => {
+    S.myStats = s.exists() ? s.data() : null;
+    S.myStatsLoaded = true;
+    refresh();
+  }, (e) => { console.error(e); S.myStatsLoaded = true; }));
+  dataUnsubs.push(onSnapshot(collection(db, 'profiles'), (snap) => {
+    const m = new Map(); snap.forEach(d => m.set(d.id, d.data()));
+    S.profiles = m; S.profilesLoaded = true; refresh();
   }, onErr));
   if (S.isAdmin) {
     dataUnsubs.push(onSnapshot(collection(db, 'users'), (snap) => {
@@ -510,6 +690,9 @@ function stopData() {
   dataUnsubs = null;
   S.decks = new Map(); S.deckParts = {}; S.decksLoaded = false; S.pendingDecks = new Map();
   S.progress = {}; S.days = {}; S.people = new Map(); S.peopleLoaded = false; S.requests = new Map();
+  S.profiles = new Map(); S.profilesLoaded = false; S.stats = new Map(); S.friendsLoaded = false; S.friendsListening = false;
+  S.myStats = null; S.myStatsLoaded = false; S.progressLoaded = false;
+  clearTimeout(statsTimer); statsTimer = 0; statsSyncedOnce = false; S.legacyDaysCopied = false;
 }
 function teardown() {
   userUnsubs.forEach(u => u()); userUnsubs = [];
@@ -523,9 +706,12 @@ function teardown() {
   migrated = false;
   mounted.study = mounted.add = mounted.people = mounted.account = false;
 }
+let statsSyncedOnce = false;
 function refresh() {
   if (S.phase !== 'app') return;
   migrateLegacy();
+  syncProfiles();
+  if (S.decksLoaded && S.progressLoaded && S.myStatsLoaded) { scheduleStatsSync(statsSyncedOnce ? 4000 : 300); statsSyncedOnce = true; }
   renderApp();
 }
 
@@ -660,6 +846,7 @@ function renderInactive() {
 const mounted = { study: false, add: false, people: false, account: false };
 
 function go(view) {
+  if (S.themePreview) closeCustomEditor(true);
   S.view = view;
   if (view === 'decks') S.dv = freshDv();
   if (view === 'account') mounted.account = false;
@@ -680,10 +867,11 @@ function renderTop() {
 function renderApp() {
   if (S.view === 'people' && !S.isAdmin) S.view = 'study';
   renderTop();
-  for (const v of ['study', 'decks', 'add', 'people', 'account']) $('view-' + v).hidden = S.view !== v;
+  for (const v of ['study', 'decks', 'add', 'friends', 'people', 'account']) $('view-' + v).hidden = S.view !== v;
   if (S.view === 'study') renderStudy();
   else if (S.view === 'decks') renderDecks();
   else if (S.view === 'add') renderAdd();
+  else if (S.view === 'friends') renderFriends();
   else if (S.view === 'people') renderPeople();
   else if (S.view === 'account') renderAccount();
 }
@@ -909,7 +1097,7 @@ function renderCard() {
   const ans = $('cardAnswer');
   const wasHidden = ans.hidden;
   ans.className = 'answer hand' + (poem ? ' poem' : '');
-  if (shown && typed && s.check) put(ans, ...renderTokens(s.check.et, 'w-miss'));
+  if (shown && typed && s.check) put(ans, ...renderTokens(s.check.et, 'exp'));
   else ans.textContent = poem ? it.text : it.a;
   ans.hidden = !shown;
   if (shown && wasHidden) { void ans.offsetWidth; ans.classList.add('show'); }
@@ -924,7 +1112,7 @@ function renderCard() {
   }
   const tc = $('typedCopy');
   tc.hidden = !(shown && typed && s.check);
-  if (shown && typed && s.check) put($('typedText'), s.typed.trim() ? renderTokens(s.check.tt, 'w-extra') : h('em', { text: '(nothing typed)' }));
+  if (shown && typed && s.check) put($('typedText'), s.typed.trim() ? renderTokens(s.check.tt, 'typed') : h('em', { text: '(nothing typed)' }));
 
   const vb = $('verdictBox');
   vb.hidden = !shown || (!typed && !poem);
@@ -948,7 +1136,12 @@ function renderCard() {
             h('button', { type: 'button', 'aria-label': 'One more', onclick: () => bump(1) }, '+')),
           h('span', { class: 'help', text: `of ${lines}` })),
         line));
-    } else put(vb, line);
+    } else {
+      const gaps = (s.check && s.check.gaps) || [];
+      put(vb, h('div', { class: 'stack-sm' }, line,
+        gaps.length ? h('p', { class: 'missing' }, h('b', { text: 'Missing: ' }),
+          gaps.slice(0, 10).map(g => `“${g}”`).join(', ') + (gaps.length > 10 ? `, and ${gaps.length - 10} more` : '')) : null));
+    }
   }
 
   const left = [];
@@ -991,7 +1184,7 @@ function revealOrCheck() {
   if (s.mode === 'type') {
     s.typed = $('typeInput').value;
     const poem = s.kind === 'poems';
-    s.check = grade(poem ? cur.it.text : cur.it.a, s.typed, poem);
+    s.check = grade(poem ? cur.it.text : cur.it.a, s.typed, s.kind);
   }
   s.phase = 'shown';
   renderCard();
@@ -1006,8 +1199,10 @@ function record(ref, right) {
     m: (prev ? Number(prev.m) || 0 : 0) + (right ? 0 : 1),
     t: Date.now(), r: right ? 1 : 0,
   };
-  save(setDoc(doc(db, 'progress', myUid()), { p: { [key]: entry }, days: { [day]: increment(1) }, updatedAt: serverTimestamp() }, { merge: true }));
-  return { key, prev, day };
+  save(setDoc(doc(db, 'progress', myUid()), { p: { [key]: entry }, updatedAt: serverTimestamp() }, { merge: true }));
+  save(setDoc(doc(db, 'stats', myUid()), { days: { [day]: { n: increment(1), r: increment(right ? 1 : 0) } }, lastActive: Date.now() }, { merge: true }));
+  scheduleStatsSync(2500);
+  return { key, prev, day, right };
 }
 function snapshotSession(s) { const { undo: _u, ...rest } = s; return JSON.parse(JSON.stringify(rest)); }
 function commit(right) {
@@ -1042,8 +1237,10 @@ function undo() {
   const s = S.session; if (!s || !s.undo.length) return;
   const last = s.undo.pop();
   if (last.write) {
-    const { key, prev, day } = last.write;
-    save(setDoc(doc(db, 'progress', myUid()), { p: { [key]: prev || deleteField() }, days: { [day]: increment(-1) }, updatedAt: serverTimestamp() }, { merge: true }));
+    const { key, prev, day, right } = last.write;
+    save(setDoc(doc(db, 'progress', myUid()), { p: { [key]: prev || deleteField() }, updatedAt: serverTimestamp() }, { merge: true }));
+    save(setDoc(doc(db, 'stats', myUid()), { days: { [day]: { n: increment(-1), r: increment(right ? -1 : 0) } } }, { merge: true }));
+    scheduleStatsSync(2500);
   }
   const stack = s.undo;
   S.session = Object.assign(last.snap, { undo: stack, finished: false });
@@ -1681,7 +1878,7 @@ function mountPeople() {
     h('div', { id: 'requestsBox' }),
     h('div', { class: 'deck-section' }, h('h3', { text: 'Accounts' }), h('ul', { class: 'people', id: 'peopleList' })));
 }
-function renderPeople() {
+function renderPeople(force) {
   if (!S.isAdmin) return;
   if (!mounted.people) mountPeople();
   const reqs = [...S.requests.entries()];
@@ -1694,7 +1891,7 @@ function renderPeople() {
           if (ok) save(deleteDoc(doc(db, 'requests', uid)));
         } }, 'Approve'),
         h('button', { type: 'button', class: 'btn ghost', onclick: () => save(deleteDoc(doc(db, 'requests', uid)), 'Request dismissed.') }, 'Dismiss')))))) : null);
-  if (S.pp.renaming) return;   // keep the rename box
+  if (S.pp.renaming && !force) return;   // keep the rename box while someone types
   const list = $('peopleList');
   const deckCounts = new Map();
   for (const d of S.decks.values()) {
@@ -1714,7 +1911,7 @@ function personRow(uid, p, counts) {
   const deckLine = `${plural(c.all, 'deck')}${c.shared ? `, ${c.shared} shared` : ''}`;
   if (S.pp.renaming === uid) {
     const inp = h('input', { type: 'text', id: 'ppRename', maxlength: '60', value: String(p.name || ''), 'aria-label': 'Name' });
-    const done = () => { S.pp.renaming = null; renderPeople(); };
+    const done = () => { S.pp.renaming = null; renderPeople(true); };
     const go2 = async () => {
       const v = inp.value.trim(); if (!v) return;
       done();
@@ -1736,13 +1933,241 @@ function personRow(uid, p, counts) {
       h('div', { class: 'pe', text: String(p.email || '') }),
       h('div', { class: 'pd', text: deckLine })),
     h('div', { class: 'row', style: 'justify-content:flex-end' },
-      h('button', { type: 'button', class: 'linkbtn', onclick: () => { S.pp.renaming = uid; renderPeople(); } }, 'Rename'),
+      h('button', { type: 'button', class: 'linkbtn', onclick: () => { S.pp.renaming = uid; renderPeople(true); } }, 'Rename'),
       p.email ? h('button', { type: 'button', class: 'linkbtn', onclick: async () => {
         try { await sendPasswordResetEmail(auth, p.email); toast(`Sent a password reset link to ${p.email}.`); } catch (e) { toast(authError(e)); }
       } }, 'Send password reset') : null),
     !isAdminRow ? h('div', { class: 'pc' },
       check('act-' + uid, 'Account on', p.active === true,
         (v) => save(updateDoc(doc(db, 'users', uid), { active: v }), v ? `${p.name} can sign in again.` : `${p.name}'s account is turned off. Their decks are kept.`))) : null);
+}
+
+// ---------------------------------------------------------------- theme picker (account page)
+function themeSwatch(id, name, finish, spec, note) {
+  const t = deriveTheme(spec);
+  const on = (S.theme && S.theme.id) === id;
+  return h('button', { type: 'button', class: 'theme-swatch', 'aria-pressed': on ? 'true' : 'false', title: note || name, 'data-key': 'th-' + id,
+    onclick: () => { if (id === 'custom') { openCustomEditor(); return; } closeCustomEditor(false); saveTheme({ id }); renderThemePicker(); } },
+    h('span', { class: 'ts-prev', 'aria-hidden': 'true', style: `background:${t['--paper']}` },
+      h('span', { class: 'ts-card', style: `background:${t['--card']};box-shadow:0 0 0 1px ${t['--line']}` },
+        h('i', { class: 'ts-margin', style: `background:${t['--margin']}` }),
+        h('i', { class: 'ts-line', style: `background:${t['--ink']}` }),
+        h('i', { class: 'ts-line short', style: `background:${t['--pen']}` })),
+      h('span', { class: 'ts-btn', style: `background:${t['--accent']}` }),
+      finish ? h('span', { class: 'ts-finish', style: `background:${finish}` }) : null),
+    h('span', { class: 'ts-name', text: name }));
+}
+function renderThemePicker() {
+  const box = $('themePicker'); if (!box) return;
+  const custom = (S.themeSaved && S.themeSaved.id === 'custom' && S.themeSaved.custom) || (S.theme.id === 'custom' && S.theme.custom) || suggestColors('#EEF2F7');
+  withFocus(box, () => put(box,
+    h('div', { class: 'theme-group' }, h('h3', { text: 'Classic & your own' }),
+      h('div', { class: 'theme-grid' },
+        themeSwatch('classic', 'Classic', null, CLASSIC_PREVIEW, 'Follows your device\'s light or dark setting'),
+        themeSwatch('custom', 'Custom', null, custom, 'Pick your own colors'))),
+    ...THEME_GROUPS.map(([group, list]) => h('div', { class: 'theme-group' }, h('h3', { text: group }),
+      h('div', { class: 'theme-grid' }, ...list.map(([id, name, finish, spec, note]) => themeSwatch(id, name, finish, spec, note)))))));
+}
+let customDraft = null;
+function openCustomEditor() {
+  const ed = $('customEditor'); if (!ed) return;
+  const start = (S.theme.id === 'custom' && S.theme.custom) || (S.themeSaved && S.themeSaved.custom) || suggestColors(deriveTheme(themeSpec(S.theme) || CLASSIC_PREVIEW)['--paper']);
+  customDraft = { bg: start.bg, accent: start.accent, pen: start.pen || start.accent, margin: start.margin || '#D8524A' };
+  const note = h('p', { class: 'help', id: 'customNote' });
+  const picker = (key, label, help) => {
+    const id = 'cu-' + key;
+    const inp = h('input', { type: 'color', id, value: customDraft[key] });
+    inp.addEventListener('input', () => { customDraft[key] = inp.value.toUpperCase(); previewCustom(); });
+    return h('label', { class: 'color-field', for: id }, inp, h('span', null, h('b', { text: label }), h('small', { text: help })));
+  };
+  const fields = h('div', { class: 'color-grid' },
+    picker('bg', 'Background', 'The page itself'),
+    picker('accent', 'Accent', 'Buttons, links, highlights'),
+    picker('pen', 'Answer ink', 'How answers are written'),
+    picker('margin', 'Margin line', 'The red line on each card'));
+  put(ed,
+    h('h3', { text: 'Custom theme' }),
+    h('p', { class: 'help', text: 'Changes show on the whole page as you pick. Light or dark is chosen from your background.' }),
+    fields,
+    note,
+    h('div', { class: 'row' },
+      h('button', { type: 'button', class: 'btn ghost', onclick: () => {
+        const s2 = suggestColors(customDraft.bg);
+        Object.assign(customDraft, s2);
+        for (const k of ['accent', 'pen', 'margin']) $('cu-' + k).value = customDraft[k];
+        previewCustom();
+      } }, 'Match colors to my background'),
+      h('span', { class: 'spacer' }),
+      h('button', { type: 'button', class: 'btn ghost', onclick: () => closeCustomEditor(true) }, 'Cancel'),
+      h('button', { type: 'button', class: 'btn primary', onclick: async () => { const th = { id: 'custom', custom: { ...customDraft } }; closeCustomEditor(false); await saveTheme(th); renderThemePicker(); } }, 'Save theme')));
+  ed.hidden = false;
+  previewCustom();
+  ed.scrollIntoView({ block: 'nearest' });
+}
+function previewCustom() {
+  if (!customDraft) return;
+  S.themePreview = true;
+  applyTheme({ id: 'custom', custom: { ...customDraft } });
+  const t = deriveTheme(customDraft);
+  const changed = [];
+  if (t['--accent'] !== customDraft.accent.toUpperCase()) changed.push('accent');
+  if (t['--pen'] !== customDraft.pen.toUpperCase()) changed.push('answer ink');
+  if (t['--margin'] !== customDraft.margin.toUpperCase()) changed.push('margin line');
+  const n = $('customNote');
+  if (n) n.textContent = changed.length ? `Your ${changed.join(' and ')} ${changed.length > 1 ? 'were' : 'was'} adjusted a little so text stays easy to read.` : '';
+}
+function closeCustomEditor(revert) {
+  const ed = $('customEditor');
+  if (ed) ed.hidden = true;
+  customDraft = null;
+  if (revert && S.themePreview) { S.themePreview = false; applyTheme(S.themeSaved || { id: 'classic' }); }
+}
+
+// ---------------------------------------------------------------- friends
+function dayCount(v) { return typeof v === 'number' ? v : Number(v && v.n) || 0; }
+function streakFrom(days) {
+  const d = new Date(); d.setHours(12, 0, 0, 0);
+  const today = dayCount(days[dayKey(d)]);
+  if (!today) d.setDate(d.getDate() - 1);
+  let count = 0;
+  while (dayCount(days[dayKey(d)]) > 0) { count++; d.setDate(d.getDate() - 1); }
+  return { count, today };
+}
+function summarizeStats(st) {
+  const days = (st && st.days) || {};
+  const d = new Date(); d.setHours(12, 0, 0, 0);
+  let week = 0, weekKnown = 0, weekRight = 0;
+  const strip = [];
+  for (let i = 0; i < 14; i++) {
+    const k = dayKey(d); const v = days[k]; const n = dayCount(v);
+    strip.unshift({ k, n });
+    if (i < 7) { week += n; if (v && typeof v === 'object' && typeof v.r === 'number') { weekKnown += n; weekRight += v.r; } }
+    d.setDate(d.getDate() - 1);
+  }
+  const s = streakFrom(days);
+  return {
+    streak: s.count, today: s.today, week, strip,
+    acc: weekKnown ? Math.max(0, Math.min(100, (weekRight / weekKnown) * 100)) : null,
+    mastered: Number(st && st.mastered) || 0, total: Number(st && st.total) || 0,
+    lastActive: Number(st && st.lastActive) || 0,
+    decks: (st && st.decks && typeof st.decks === 'object') ? st.decks : {},
+  };
+}
+function ensureFriendsListener() {
+  if (S.friendsListening || !dataUnsubs) return;
+  S.friendsListening = true;
+  dataUnsubs.push(onSnapshot(collection(db, 'stats'), (snap) => {
+    const m = new Map(); snap.forEach(d => m.set(d.id, d.data()));
+    S.stats = m; S.friendsLoaded = true; refresh();
+  }, (e) => { console.error(e); S.friendsLoaded = true; refresh(); }));
+}
+function initialsOf(name) { return String(name || '?').split(/\s+/).filter(Boolean).slice(0, 2).map(w => w[0].toUpperCase()).join('') || '?'; }
+function renderFriends() {
+  ensureFriendsListener();
+  const root = $('view-friends');
+  if (!S.friendsLoaded || !S.profilesLoaded) { put(root, h('div', { class: 'block-note' }, h('p', { text: 'Loading everyone\'s progress…' }))); return; }
+  const now = Date.now();
+  const rows = [...S.profiles.entries()].filter(([, p]) => p.active !== false)
+    .map(([uid, p]) => ({ uid, name: String(p.name || 'Friend'), me: uid === myUid(), s: summarizeStats(S.stats.get(uid)) }));
+  const sortKey = S.friendsSort || 'week';
+  rows.sort((a, b) => (sortKey === 'streak' ? b.s.streak - a.s.streak : sortKey === 'mastered' ? b.s.mastered - a.s.mastered : b.s.week - a.s.week) || a.name.localeCompare(b.name));
+  const groupWeek = rows.reduce((a, r) => a + r.s.week, 0);
+  const maxStrip = Math.max(1, ...rows.flatMap(r => r.s.strip.map(x => x.n)));
+  const row = (r) => {
+    const s = r.s;
+    const deckList = Object.values(s.decks).filter(x => x && x.name).sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    const line = [
+      h('span', null, h('b', { text: String(s.streak) }), s.streak === 1 ? ' day streak' : ' day streak'),
+      h('span', null, h('b', { text: String(s.week) }), ' this week'),
+      s.acc != null ? h('span', null, h('b', { text: pct(s.acc) }), ' right') : null,
+    ];
+    return h('li', { class: 'friend' + (r.me ? ' me' : '') },
+      h('span', { class: 'f-avatar', 'aria-hidden': 'true', text: initialsOf(r.name) }),
+      h('div', { class: 'f-main' },
+        h('div', { class: 'f-name' }, h('span', { text: r.name }), r.me ? h('span', { class: 'pill uni', text: 'you' }) : null,
+          h('span', { class: 'f-last', text: s.lastActive ? 'studied ' + ago(s.lastActive, now) : 'no activity yet' })),
+        h('div', { class: 'f-line' }, ...line),
+        h('div', { class: 'f-strip', role: 'img', 'aria-label': `Last 14 days: ${s.strip.map(x => x.n).join(', ')}` },
+          ...s.strip.map(x => h('i', { title: `${x.k}: ${x.n}`, style: x.n ? `opacity:${(0.3 + 0.7 * Math.min(1, x.n / maxStrip)).toFixed(2)}` : '', class: x.n ? 'on' : '' }))),
+        h('div', { class: 'f-mast' },
+          h('span', { class: 'bar', 'aria-hidden': 'true' }, h('i', { style: `width:${s.total ? Math.round(s.mastered / s.total * 100) : 0}%` })),
+          h('span', { text: s.total ? `${s.mastered.toLocaleString()} of ${s.total.toLocaleString()} mastered` : 'nothing to study yet' })),
+        deckList.length ? h('details', { class: 'f-decks' }, h('summary', { text: `Shared decks (${deckList.length})` }),
+          h('ul', null, ...deckList.map(x => h('li', null,
+            h('span', { class: 'fd-name', text: String(x.name) }),
+            h('span', { class: 'bar', 'aria-hidden': 'true' }, h('i', { style: `width:${x.total ? Math.round((Number(x.mastered) || 0) / x.total * 100) : 0}%` })),
+            h('span', { class: 'mono', text: `${Number(x.mastered) || 0}/${Number(x.total) || 0}` }))))) : null));
+  };
+  put(root,
+    h('div', { class: 'row', style: 'align-items:flex-start' },
+      h('div', { style: 'flex:1 1 18rem;min-width:0' }, h('h1', { text: 'Friends' }),
+        h('p', { class: 'lede', text: `How everyone is doing, updated live. The group wrote ${groupWeek.toLocaleString()} this week.` })),
+      seg('friendsSort', [['week', 'This week'], ['streak', 'Streak'], ['mastered', 'Mastered']], sortKey, (k) => { S.friendsSort = k; renderFriends(); })),
+    rows.length ? h('ul', { class: 'friends' }, ...rows.map(row)) : h('p', { class: 'empty-line', text: 'No one here yet.' }),
+    h('p', { class: 'help', text: 'Totals include everyone\'s private decks, but only shared decks are listed by name. "Mastered" means right at least 3 times, including the last time.' }));
+}
+
+// ---------------------------------------------------------------- keeping names and summaries in sync
+function stableStr(v) {
+  if (Array.isArray(v)) return '[' + v.map(stableStr).join(',') + ']';
+  if (v && typeof v === 'object') return '{' + Object.keys(v).sort().map(k => JSON.stringify(k) + ':' + stableStr(v[k])).join(',') + '}';
+  return JSON.stringify(v);
+}
+function computeMyStats() {
+  let mastered = 0, studied = 0, total = 0;
+  const decks = {};
+  for (const d of S.decks.values()) {
+    if (category(d) === 'other') continue;
+    const its = itemsOf(d);
+    let dm = 0, ds = 0;
+    for (const [iid] of its) { const pr = progOf(d.id, iid); if (pr && Number(pr.t)) ds++; if (isMastered(pr)) dm++; }
+    total += its.length; mastered += dm; studied += ds;
+    if (d.visibility === 'shared' && ds > 0) decks[d.id] = { name: d.name.slice(0, 80), kind: d.kind, total: its.length, mastered: dm, studied: ds };
+  }
+  return { mastered, studied, total, decks };
+}
+let statsTimer = 0;
+// Runs at most once per delay, even while answers keep coming in.
+function scheduleStatsSync(delay) {
+  if (statsTimer) return;
+  statsTimer = setTimeout(() => { statsTimer = 0; syncMyStats(); }, delay);
+}
+function syncMyStats() {
+  if (!S.decksLoaded || !S.progressLoaded || !S.myStatsLoaded || !myUid()) return;
+  const sum = computeMyStats();
+  const cur = S.myStats || {};
+  const same = cur.mastered === sum.mastered && cur.studied === sum.studied && cur.total === sum.total && stableStr(cur.decks || {}) === stableStr(sum.decks);
+  // Days counted by version 2.0 (before the Friends tab) get copied over once, so streaks carry on.
+  const legacy = {};
+  for (const [k, v] of Object.entries(S.days || {})) if (Number(v) > 0 && !(cur.days && cur.days[k])) legacy[k] = { n: Number(v) };
+  if (Object.keys(legacy).length && !S.legacyDaysCopied) {
+    S.legacyDaysCopied = true;
+    save(setDoc(doc(db, 'stats', myUid()), { days: legacy }, { merge: true }));
+  }
+  if (same) return;
+  save(setDoc(doc(db, 'stats', myUid()), { ...sum, updatedAt: serverTimestamp() }, { mergeFields: ['mastered', 'studied', 'total', 'decks', 'updatedAt'] }));
+}
+let profileSyncing = false;
+function syncProfiles() {
+  if (!S.profilesLoaded || profileSyncing) return;
+  const uid = myUid();
+  if (S.isAdmin) {
+    if (!S.peopleLoaded) return;
+    const ops = [];
+    for (const [id, u] of S.people) {
+      const p = S.profiles.get(id);
+      const want = { name: String(u.name || 'Friend').slice(0, 60), active: id === S.adminUid ? true : u.active === true };
+      if (!p || p.name !== want.name || p.active !== want.active) ops.push([id, want]);
+    }
+    if (!ops.length) return;
+    profileSyncing = true;
+    const b = writeBatch(db);
+    for (const [id, w] of ops) b.set(doc(db, 'profiles', id), w);
+    save(b.commit()).finally(() => { profileSyncing = false; });
+  } else if (S.me && !S.profiles.has(uid)) {
+    profileSyncing = true;
+    save(setDoc(doc(db, 'profiles', uid), { name: String(S.me.name || 'Friend').slice(0, 60) })).finally(() => { profileSyncing = false; });
+  }
 }
 
 // ---------------------------------------------------------------- account
@@ -1755,13 +2180,19 @@ function renderAccount() {
     const v = name.value.trim();
     if (!v) { status.className = 'status err'; status.textContent = 'Your name can\'t be empty.'; return; }
     const ok = await save(updateDoc(doc(db, 'users', myUid()), { name: v.slice(0, 60) }));
+    if (ok) await save(setDoc(doc(db, 'profiles', myUid()), { name: v.slice(0, 60) }, { merge: true }));
     if (ok && S.isAdmin) await save(updateDoc(doc(db, 'meta', 'admin'), { name: v.slice(0, 60) }));
-    if (ok) { status.className = 'status ok'; status.textContent = 'Saved. New decks will show this name.'; }
+    if (ok) { status.className = 'status ok'; status.textContent = 'Saved. Everyone will see the new name.'; }
   };
   put($('view-account'),
     h('div', null, h('h1', { text: 'Your account' }), h('p', { class: 'lede', text: (S.fbUser.email || '') + (S.isAdmin ? ' · admin' : '') })),
     h('form', { class: 'panel-box', novalidate: true, onsubmit: (e) => { e.preventDefault(); saveName(); } },
       field('Your name', name), h('div', { class: 'row' }, h('button', { type: 'submit', class: 'btn primary' }, 'Save name')), status),
+    h('div', { class: 'panel-box' },
+      h('h2', { text: 'Theme' }),
+      h('p', { class: 'help', text: 'Colors from the iPhone lineups, each with its own matching accents. Your choice follows you to any device you sign in on.' }),
+      h('div', { id: 'customEditor', class: 'custom-editor', hidden: true }),
+      h('div', { id: 'themePicker', class: 'stack' })),
     h('div', { class: 'panel-box' },
       h('h2', { text: 'Password' }),
       h('p', { class: 'help', text: 'We\'ll email you a link to set a new password.' }),
@@ -1769,6 +2200,7 @@ function renderAccount() {
         try { await sendPasswordResetEmail(auth, S.fbUser.email); toast('Check your email for a link to set a new password.'); } catch (e) { toast(authError(e)); }
       } }, 'Email me a reset link'))),
     h('div', null, h('button', { type: 'button', class: 'btn ghost', onclick: () => signOut(auth) }, 'Sign out')));
+  renderThemePicker();
 }
 
 // ---------------------------------------------------------------- events
@@ -1809,4 +2241,6 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
+try { S.themeSaved = JSON.parse(localStorage.getItem('rbh.theme') || 'null'); } catch (e) { S.themeSaved = null; }
+applyTheme(S.themeSaved || { id: 'classic' });
 boot();
